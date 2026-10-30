@@ -36,6 +36,7 @@ def get_days_until(day: int, month: int) -> int:
         return (target_next_year - today).days
 
 
+# --- Personal Registration Modal ---
 class CleanBirthdayModal(discord.ui.Modal, title="Register Your Birthday"):
     day = discord.ui.TextInput(
         label="Day of Birth (1-31)",
@@ -86,6 +87,7 @@ class CleanBirthdayModal(discord.ui.Modal, title="Register Your Birthday"):
         )
 
 
+# --- Master Override Modal ---
 class MasterSetModal(discord.ui.Modal):
     def __init__(self, cog, target_member: discord.Member):
         super().__init__(title=f"Set Birthday: {target_member.name[:16]}")
@@ -135,6 +137,7 @@ class MasterSetModal(discord.ui.Modal):
         )
 
 
+# --- User Select Dropdown for Master Control ---
 class DirectorMemberSelect(discord.ui.UserSelect):
     def __init__(self, cog):
         super().__init__(
@@ -156,6 +159,7 @@ class MasterUserPickerView(discord.ui.View):
         self.add_item(DirectorMemberSelect(cog))
 
 
+# --- Main Clean Dashboard Buttons ---
 class CleanBirthdayView(discord.ui.View):
     def __init__(self, cog):
         super().__init__(timeout=None)
@@ -173,7 +177,7 @@ class CleanBirthdayView(discord.ui.View):
     @discord.ui.button(
         label="Check Birthday",
         style=discord.ButtonStyle.secondary,
-        emoji="🔍",
+        emoji="📋",
         custom_id="bday_check_clean"
     )
     async def check_bday(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -181,7 +185,7 @@ class CleanBirthdayView(discord.ui.View):
 
         try:
             if not self.cog.bot.db:
-                await interaction.followup.send("⚠️ Database connection initializing. Try again in a few seconds.", ephemeral=True)
+                await interaction.followup.send("⚠️ Database connection is still initializing. Please try again.", ephemeral=True)
                 return
 
             await self.cog.bot.db.execute("""
@@ -194,33 +198,66 @@ class CleanBirthdayView(discord.ui.View):
             """)
             await self.cog.bot.db.commit()
 
-            async with self.cog.bot.db.execute(
-                "SELECT user_name, day, month FROM birthdays WHERE user_id = ?",
-                (interaction.user.id,)
-            ) as cursor:
-                record = await cursor.fetchone()
+            # Retrieve all birthdays from the database
+            async with self.cog.bot.db.execute("SELECT user_id, user_name, day, month FROM birthdays") as cursor:
+                records = await cursor.fetchall()
 
-            if record:
-                name, d, m = record[0] or interaction.user.display_name, record[1], record[2]
-                days_left = get_days_until(d, m)
-                countdown_text = "🎉 **TODAY IS YOUR BIRTHDAY!**" if days_left == 0 else f"**{days_left}** days remaining"
+            if not records:
+                await interaction.followup.send("📅 No birthdays have been registered yet! Click **Set My Birthday** to be the first.", ephemeral=True)
+                return
 
-                embed = discord.Embed(
-                    title=f"🎂 Birthday Details: {name}",
-                    color=discord.Color.blue()
-                )
-                embed.add_field(name="Date", value=f"`{d:02d}/{m:02d}`", inline=True)
-                embed.add_field(name="Countdown", value=countdown_text, inline=True)
-                embed.set_footer(text="Registered in server database")
-                await interaction.followup.send(embed=embed, ephemeral=True)
+            # Enrich and sort all birthdays by days remaining
+            enriched_list = []
+            for uid, name, d, m in records:
+                days = get_days_until(d, m)
+                enriched_list.append((days, uid, name, d, m))
+
+            enriched_list.sort(key=lambda x: x[0])
+
+            embed = discord.Embed(
+                title="📅 Server Birthday Directory",
+                description="List of all registered birthdays sorted by upcoming dates:\n",
+                color=discord.Color.blue()
+            )
+
+            lines = []
+            for days, uid, name, d, m in enriched_list:
+                if days == 0:
+                    badge = "🎉 **TODAY!**"
+                elif days == 1:
+                    badge = "⏳ **Tomorrow!**"
+                else:
+                    badge = f"in **{days}** days"
+
+                display_title = name or f"User {uid}"
+                lines.append(f"• **{display_title}** (<@{uid}>) — `{d:02d}/{m:02d}` ({badge})")
+
+            # Format lines (Discord embed field value limit is 1024 characters)
+            field_text = "\n".join(lines)
+            if len(field_text) > 1024:
+                # Split cleanly if there are many entries
+                parts = []
+                current_part = ""
+                for line in lines:
+                    if len(current_part) + len(line) + 1 > 1000:
+                        parts.append(current_part)
+                        current_part = line + "\n"
+                    else:
+                        current_part += line + "\n"
+                if current_part:
+                    parts.append(current_part)
+
+                for idx, part in enumerate(parts):
+                    embed.add_field(name=f"Birthdays ({idx + 1}/{len(parts)})", value=part, inline=False)
             else:
-                await interaction.followup.send(
-                    "❓ You haven't registered your birthday yet. Click **Set My Birthday** to add it!",
-                    ephemeral=True
-                )
+                embed.add_field(name=f"Registered Members ({len(records)})", value=field_text, inline=False)
+
+            embed.set_footer(text=f"Requested by {interaction.user.display_name} • Live Countdown")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
         except Exception as e:
-            print(f"[CHECK BDAY ERROR] {e}")
-            await interaction.followup.send(f"⚠️ Error checking birthday: `{e}`", ephemeral=True)
+            print(f"[CHECK BDAY LIST ERROR] {e}")
+            await interaction.followup.send(f"⚠️ Error retrieving birthdays: `{e}`", ephemeral=True)
 
     @discord.ui.button(
         label="Master Register",
@@ -241,6 +278,7 @@ class CleanBirthdayView(discord.ui.View):
         )
 
 
+# --- Birthday Cog Engine ---
 class Birthdays(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -281,7 +319,7 @@ class Birthdays(commands.Cog):
     async def create_panel_embed(self) -> discord.Embed:
         embed = discord.Embed(
             title="🎂 Register the birthday",
-            description="Select an option below to register your birthday or view your countdown.",
+            description="Select an option below to register your birthday or view the full list with countdowns.",
             color=discord.Color.from_rgb(235, 69, 158)
         )
         if config.BDAY_BANNER:
@@ -307,7 +345,7 @@ class Birthdays(commands.Cog):
         if roster_lines:
             embed.add_field(name="Upcoming Birthdays", value="\n".join(roster_lines), inline=False)
 
-        embed.set_footer(text="Click 'Set My Birthday' to get started")
+        embed.set_footer(text="Click 'Check Birthday' to see all member countdowns")
         return embed
 
     @tasks.loop(hours=24)
