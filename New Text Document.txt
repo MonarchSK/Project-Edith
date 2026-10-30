@@ -1,0 +1,14 @@
+Project-Edith/
+├── .gitignore
+├── requirements.txt
+├── config.py
+├── main.py
+└── cogs/
+    ├── __init__.py
+    ├── backup.py
+    ├── birthdays.py
+    ├── color_roles.py
+    ├── confessions.py
+    ├── layout_setup.py
+    ├── nicknames.py
+    └── tickets.py
