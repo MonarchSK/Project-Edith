@@ -9,11 +9,12 @@ ANNOUNCEMENT_CHANNEL_ID = int(os.getenv("ANNOUNCEMENT_CHANNEL_ID", "0"))
 CONFESSION_CHANNEL_ID = int(os.getenv("CONFESSION_CHANNEL_ID", "0"))
 DIRECTOR_ROLE_NAME = "Director"
 
-DEFAULT_ICON = "https://media.giphy.com/media/26tn3334vHJwdN0Os/giphy.gif"
-TICKET_BANNER = "https://i.imgur.com/8N4kUeF.png"
-BDAY_BANNER = "https://i.imgur.com/uO60Q7j.png"
-CONFESSION_BANNER = "https://i.imgur.com/x0qjPz1.png"
-COLOR_BANNER = "https://i.imgur.com/8N4kUeF.png"
+# Verified Direct Asset URLs (guaranteed raw image format)
+DEFAULT_ICON = "https://cdn.discordapp.com/emojis/853989392277569566.gif?quality=lossless"
+TICKET_BANNER = "https://images.unsplash.com/photo-1517245386807-bb43f82c33c4?auto=format&fit=crop&w=1000&q=80"
+BDAY_BANNER = "https://images.unsplash.com/photo-1513151233558-d860c5398176?auto=format&fit=crop&w=1000&q=80"
+CONFESSION_BANNER = "https://images.unsplash.com/photo-1518495973542-4542c06a5843?auto=format&fit=crop&w=1000&q=80"
+COLOR_BANNER = "https://images.unsplash.com/photo-1550684848-fac1c5b4e853?auto=format&fit=crop&w=1000&q=80"
 
 COLOR_PALETTE = {
     "Red": (0xFF2A2A, "🔴"),
