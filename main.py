@@ -1,307 +1,77 @@
-import random
+import os
+import sys
 import asyncio
-from datetime import datetime, date, timezone
+import aiosqlite
 import discord
-from discord import app_commands
-from discord.ext import commands, tasks
+from discord.ext import commands
+from datetime import datetime, timezone
 import config
 
-RANDOM_BIRTHDAY_WISHES = [
-    "Wishing you a year filled with happiness, health, and endless success! Have an amazing birthday! 🎂🎉",
-    "May your day be as bright, joyful, and wonderful as you are! Happy Birthday! ✨🎈",
-    "Another year older, wiser, and more incredible! Enjoy every moment of your special day! 🥳🍰",
-    "Sending you warm smiles and the best vibes on your birthday! Have a blast! 🎊🎁",
-    "May all your dreams and wishes come true this year. Happy Birthday to a valued member! 🌟🎂",
-    "Cheers to another full trip around the sun! Hope your day is filled with cake and celebration! 🎈🥂",
-    "Wishing you joy, great company, and lots of memorable moments today. Happy Birthday! 🎉💖",
-    "May your upcoming year bring new opportunities, great memories, and lots of laughter! 🍰🎁",
-    "Happy Birthday! Thank you for being such an awesome part of our server community! 🥳✨",
-    "Here’s to celebrating you today! Eat plenty of cake and enjoy your special day to the fullest! 🎂🎊"
-]
+DB_PATH = "bot_database.db"
 
-def get_days_until(day: int, month: int) -> int:
-    today = date.today()
-    try:
-        target_this_year = date(today.year, month, day)
-    except ValueError:
-        target_this_year = date(today.year, month, 28)
+intents = discord.Intents.default()
+intents.members = True
+intents.message_content = True
 
-    if target_this_year >= today:
-        return (target_this_year - today).days
-    else:
-        try:
-            target_next_year = date(today.year + 1, month, day)
-        except ValueError:
-            target_next_year = date(today.year + 1, month, 28)
-        return (target_next_year - today).days
-
-
-# --- Personal Registration Modal ---
-class CleanBirthdayModal(discord.ui.Modal, title="Register Your Birthday"):
-    day = discord.ui.TextInput(
-        label="Day of Birth (1-31)",
-        placeholder="e.g. 15",
-        min_length=1,
-        max_length=2,
-        required=True
-    )
-    month = discord.ui.TextInput(
-        label="Month of Birth (1-12)",
-        placeholder="e.g. 8 for August",
-        min_length=1,
-        max_length=2,
-        required=True
-    )
-
-    def __init__(self, cog):
-        super().__init__()
-        self.cog = cog
-
-    async def on_submit(self, interaction: discord.Interaction):
-        # 1. Immediately acknowledge to beat the 3-second Discord deadline
-        await interaction.response.defer(ephemeral=True)
-
-        try:
-            d = int(self.day.value.strip())
-            m = int(self.month.value.strip())
-        except ValueError:
-            await interaction.followup.send("❌ Day and month must be numbers.", ephemeral=True)
-            return
-
-        if not (1 <= d <= 31 and 1 <= m <= 12):
-            await interaction.followup.send("❌ Please enter a valid day (1-31) and month (1-12).", ephemeral=True)
-            return
-
-        user_name = interaction.user.display_name
-        try:
-            await self.cog.save_birthday(interaction.user.id, user_name, d, m)
-            days_left = get_days_until(d, m)
-            countdown_text = "🎉 **Your birthday is TODAY!**" if days_left == 0 else f"**{days_left}** days remaining"
-
-            await interaction.followup.send(
-                f"✅ **Birthday Registered!**\n"
-                f"• **Member:** {interaction.user.mention}\n"
-                f"• **Date:** `{d:02d}/{m:02d}`\n"
-                f"• **Countdown:** {countdown_text}\n"
-                f"• *Database snapshot pushed to `#bot-memory` in background.*",
-                ephemeral=True
-            )
-        except Exception as e:
-            print(f"[SAVE BDAY ERROR] {e}")
-            await interaction.followup.send(f"⚠️ Failed to save birthday: `{e}`", ephemeral=True)
-
-
-# --- Master Override Modal ---
-class MasterSetModal(discord.ui.Modal):
-    def __init__(self, cog, target_member: discord.Member):
-        super().__init__(title=f"Set Birthday: {target_member.name[:16]}")
-        self.cog = cog
-        self.target_member = target_member
-
-        self.day = discord.ui.TextInput(
-            label="Day (1-31)",
-            placeholder="e.g. 24",
-            min_length=1,
-            max_length=2,
-            required=True
-        )
-        self.month = discord.ui.TextInput(
-            label="Month (1-12)",
-            placeholder="e.g. 10",
-            min_length=1,
-            max_length=2,
-            required=True
-        )
-        self.add_item(self.day)
-        self.add_item(self.month)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        # 1. Immediately acknowledge to beat the 3-second Discord deadline
-        await interaction.response.defer(ephemeral=True)
-
-        try:
-            d = int(self.day.value.strip())
-            m = int(self.month.value.strip())
-        except ValueError:
-            await interaction.followup.send("❌ Values must be numbers.", ephemeral=True)
-            return
-
-        if not (1 <= d <= 31 and 1 <= m <= 12):
-            await interaction.followup.send("❌ Invalid date values.", ephemeral=True)
-            return
-
-        try:
-            await self.cog.save_birthday(self.target_member.id, self.target_member.display_name, d, m)
-            days_left = get_days_until(d, m)
-
-            await interaction.followup.send(
-                f"✅ **Birthday Added for {self.target_member.mention}!**\n"
-                f"• **Date:** `{d:02d}/{m:02d}`\n"
-                f"• **Days Left:** **{days_left}** days\n"
-                f"• *Database snapshot pushed to `#bot-memory` in background.*",
-                ephemeral=True
-            )
-        except Exception as e:
-            print(f"[MASTER SAVE ERROR] {e}")
-            await interaction.followup.send(f"⚠️ Failed to save birthday: `{e}`", ephemeral=True)
-
-
-# --- User Select Dropdown for Master Control ---
-class DirectorMemberSelect(discord.ui.UserSelect):
-    def __init__(self, cog):
+class UtilityBot(commands.Bot):
+    def __init__(self):
         super().__init__(
-            placeholder="Choose a server member to set their birthday...",
-            min_values=1,
-            max_values=1
+            command_prefix=".",
+            intents=intents,
+            help_command=None
         )
-        self.cog = cog
+        self.db: aiosqlite.Connection = None
+        self.restore_report = {
+            "success": False,
+            "filename": None,
+            "timestamp": None,
+            "filesize_kb": 0.0,
+            "is_fresh": False
+        }
 
-    async def callback(self, interaction: discord.Interaction):
-        selected_user = self.values[0]
-        member = interaction.guild.get_member(selected_user.id) or selected_user
-        await interaction.response.send_modal(MasterSetModal(self.cog, member))
-
-
-class MasterUserPickerView(discord.ui.View):
-    def __init__(self, cog):
-        super().__init__(timeout=60)
-        self.add_item(DirectorMemberSelect(cog))
-
-
-# --- Main Clean Dashboard Buttons ---
-class CleanBirthdayView(discord.ui.View):
-    def __init__(self, cog):
-        super().__init__(timeout=None)
-        self.cog = cog
-
-    @discord.ui.button(
-        label="Set My Birthday",
-        style=discord.ButtonStyle.primary,
-        emoji="🎂",
-        custom_id="bday_set_clean"
-    )
-    async def set_bday(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(CleanBirthdayModal(self.cog))
-
-    @discord.ui.button(
-        label="Check Birthday",
-        style=discord.ButtonStyle.secondary,
-        emoji="📋",
-        custom_id="bday_check_clean"
-    )
-    async def check_bday(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-
-        try:
-            if not self.cog.bot.db:
-                await interaction.followup.send("⚠️ Database connection is still initializing. Please try again.", ephemeral=True)
-                return
-
-            await self.cog.bot.db.execute("""
-                CREATE TABLE IF NOT EXISTS birthdays (
-                    user_id INTEGER PRIMARY KEY,
-                    user_name TEXT,
-                    day INTEGER NOT NULL,
-                    month INTEGER NOT NULL
-                )
-            """)
-            await self.cog.bot.db.commit()
-
-            async with self.cog.bot.db.execute("SELECT user_id, user_name, day, month FROM birthdays") as cursor:
-                records = await cursor.fetchall()
-
-            if not records:
-                await interaction.followup.send("📅 No birthdays have been registered yet! Click **Set My Birthday** to be the first.", ephemeral=True)
-                return
-
-            enriched_list = []
-            for uid, name, d, m in records:
-                days = get_days_until(d, m)
-                enriched_list.append((days, uid, name, d, m))
-
-            enriched_list.sort(key=lambda x: x[0])
-
-            embed = discord.Embed(
-                title="📅 Server Birthday Directory",
-                description="List of all registered birthdays sorted by upcoming dates:\n",
-                color=discord.Color.blue()
-            )
-
-            lines = []
-            for days, uid, name, d, m in enriched_list:
-                if days == 0:
-                    badge = "🎉 **TODAY!**"
-                elif days == 1:
-                    badge = "⏳ **Tomorrow!**"
-                else:
-                    badge = f"in **{days}** days"
-
-                display_title = name or f"User {uid}"
-                lines.append(f"• **{display_title}** (<@{uid}>) — `{d:02d}/{m:02d}` ({badge})")
-
-            field_text = "\n".join(lines)
-            if len(field_text) > 1024:
-                parts = []
-                current_part = ""
-                for line in lines:
-                    if len(current_part) + len(line) + 1 > 1000:
-                        parts.append(current_part)
-                        current_part = line + "\n"
-                    else:
-                        current_part += line + "\n"
-                if current_part:
-                    parts.append(current_part)
-
-                for idx, part in enumerate(parts):
-                    embed.add_field(name=f"Birthdays ({idx + 1}/{len(parts)})", value=part, inline=False)
-            else:
-                embed.add_field(name=f"Registered Members ({len(records)})", value=field_text, inline=False)
-
-            embed.set_footer(text=f"Requested by {interaction.user.display_name} • Live Countdown")
-            await interaction.followup.send(embed=embed, ephemeral=True)
-
-        except Exception as e:
-            print(f"[CHECK BDAY LIST ERROR] {e}")
-            await interaction.followup.send(f"⚠️ Error retrieving birthdays: `{e}`", ephemeral=True)
-
-    @discord.ui.button(
-        label="Master Register",
-        style=discord.ButtonStyle.danger,
-        emoji="👑",
-        custom_id="bday_master_clean"
-    )
-    async def master_override(self, interaction: discord.Interaction, button: discord.ui.Button):
-        has_director = any(r.name == config.DIRECTOR_ROLE_NAME for r in interaction.user.roles)
-        if not (has_director or interaction.user.guild_permissions.administrator):
-            await interaction.response.send_message("⛔ Only Directors and Admins can use Master Register.", ephemeral=True)
+    async def restore_database_from_discord(self):
+        """Scans the designated backup channel and pulls down the latest valid .db file."""
+        backup_id = int(os.getenv("BACKUP_CHANNEL_ID", getattr(config, "BACKUP_CHANNEL_ID", 0)))
+        if not backup_id or backup_id == 0:
+            print("[RESTORE] BACKUP_CHANNEL_ID is unset or 0. Initializing fresh database.")
+            self.restore_report["is_fresh"] = True
             return
 
-        await interaction.response.send_message(
-            "Select a member from the dropdown below:",
-            view=MasterUserPickerView(self.cog),
-            ephemeral=True
-        )
+        token = getattr(config, "TOKEN", None) or os.getenv("DISCORD_TOKEN")
+        try:
+            await self.login(token)
+            channel = self.get_channel(backup_id) or await self.fetch_channel(backup_id)
+            print(f"[RESTORE] Scanning #{channel.name} for persistent database backups...")
 
+            async for message in channel.history(limit=50):
+                for attachment in message.attachments:
+                    if attachment.filename.endswith(".db"):
+                        await attachment.save(DB_PATH)
+                        size_kb = os.path.getsize(DB_PATH) / 1024
+                        self.restore_report = {
+                            "success": True,
+                            "filename": attachment.filename,
+                            "timestamp": message.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                            "filesize_kb": round(size_kb, 2),
+                            "is_fresh": False
+                        }
+                        print(f"[RESTORE] Restored persistent storage from '{attachment.filename}' ({round(size_kb, 2)} KB)")
+                        return
+        except Exception as e:
+            print(f"[RESTORE ERROR] Could not retrieve snapshot: {e}")
 
-# --- Birthday Cog Engine ---
-class Birthdays(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-        self.check_birthdays.start()
+        print("[RESTORE] No prior backup file found in channel history. Starting fresh database.")
+        self.restore_report["is_fresh"] = True
 
-    def cog_unload(self):
-        self.check_birthdays.cancel()
+    async def setup_hook(self):
+        # 1. Download database snapshot BEFORE establishing active SQLite handle
+        await self.restore_database_from_discord()
 
-    def trigger_auto_backup(self, trigger_user: str):
-        """Dispatches backup task completely detached in the background so it never blocks the modal."""
-        backup_cog = self.bot.get_cog("DiscordMemoryBackup")
-        if backup_cog and hasattr(backup_cog, "upload_backup_and_prune"):
-            asyncio.create_task(
-                backup_cog.upload_backup_and_prune(reason=f"Auto-Sync: Birthday saved for {trigger_user}")
-            )
+        # 2. Establish connection to persistent or fresh local DB
+        self.db = await aiosqlite.connect(DB_PATH)
 
-    async def save_birthday(self, user_id: int, user_name: str, day: int, month: int):
-        await self.bot.db.execute("""
+        # 3. Ensure essential schemas exist
+        await self.db.execute("""
             CREATE TABLE IF NOT EXISTS birthdays (
                 user_id INTEGER PRIMARY KEY,
                 user_name TEXT,
@@ -309,100 +79,131 @@ class Birthdays(commands.Cog):
                 month INTEGER NOT NULL
             )
         """)
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS confessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await self.db.commit()
 
-        await self.bot.db.execute("""
-            INSERT INTO birthdays (user_id, user_name, day, month)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                user_name = excluded.user_name,
-                day = excluded.day,
-                month = excluded.month
-        """, (user_id, user_name, day, month))
-        await self.bot.db.commit()
+        # 4. Load all extensions from cogs directory
+        cogs_dir = os.path.join(os.path.dirname(__file__), "cogs")
+        if os.path.exists(cogs_dir):
+            for filename in os.listdir(cogs_dir):
+                if filename.endswith(".py") and not filename.startswith("__"):
+                    cog_name = f"cogs.{filename[:-3]}"
+                    try:
+                        await self.load_extension(cog_name)
+                        print(f"[COG LOADED] {cog_name}")
+                    except Exception as e:
+                        print(f"[COG ERROR] Failed loading {cog_name}: {e}", file=sys.stderr)
 
-        # Fire and forget background backup
-        self.trigger_auto_backup(user_name)
+        # 5. Register persistent UI views so buttons survive restarts
+        from cogs.birthdays import CleanBirthdayView
+        from cogs.tickets import TicketPluginView, ActiveTicketControls
+        from cogs.confessions import ConfessionPluginView
+        from cogs.color_roles import ColorPluginPanel
 
-    async def create_panel_embed(self) -> discord.Embed:
-        embed = discord.Embed(
-            title="🎂 Register the birthday",
-            description="Select an option below to register your birthday or view the full list with countdowns.",
-            color=discord.Color.from_rgb(235, 69, 158)
-        )
-        if config.BDAY_BANNER:
-            embed.set_image(url=config.BDAY_BANNER)
+        bday_cog = self.get_cog("Birthdays")
+        if bday_cog:
+            self.add_view(CleanBirthdayView(bday_cog))
+        self.add_view(TicketPluginView())
+        self.add_view(ActiveTicketControls())
+        self.add_view(ConfessionPluginView(self))
 
-        roster_lines = []
+        color_cog = self.get_cog("ColorRoles")
+        if color_cog:
+            self.add_view(ColorPluginPanel(color_cog))
+
+        # 6. Synchronize application slash commands
         try:
-            async with self.bot.db.execute("SELECT user_id, user_name, day, month FROM birthdays") as cursor:
-                records = await cursor.fetchall()
-                if records:
-                    enriched = []
-                    for r in records:
-                        days = get_days_until(r[2], r[3])
-                        enriched.append((days, r[0], r[1], r[2], r[3]))
-                    enriched.sort(key=lambda x: x[0])
+            synced = await self.tree.sync()
+            print(f"[SLASH] Synced {len(synced)} slash commands.")
+        except Exception as e:
+            print(f"[SLASH ERROR] Slash command sync failed: {e}", file=sys.stderr)
 
-                    for days, uid, name, d, m in enriched[:5]:
-                        badge = "🎉 Today!" if days == 0 else f"in {days} days"
-                        roster_lines.append(f"• **{name or 'Member'}** (<@{uid}>) — `{d:02d}/{m:02d}` ({badge})")
-        except Exception:
-            pass
-
-        if roster_lines:
-            embed.add_field(name="Upcoming Birthdays", value="\n".join(roster_lines), inline=False)
-
-        embed.set_footer(text="Click 'Check Birthday' to see all member countdowns")
-        return embed
-
-    @tasks.loop(hours=24)
-    async def check_birthdays(self):
-        now = datetime.now(timezone.utc)
-        async with self.bot.db.execute(
-            "SELECT user_id, user_name FROM birthdays WHERE day = ? AND month = ?",
-            (now.day, now.month)
-        ) as cursor:
-            celebrants = await cursor.fetchall()
-
-        if not celebrants or not config.ANNOUNCEMENT_CHANNEL_ID:
+    async def send_startup_embed(self):
+        backup_id = int(os.getenv("BACKUP_CHANNEL_ID", getattr(config, "BACKUP_CHANNEL_ID", 0)))
+        if not backup_id or backup_id == 0:
             return
 
-        channel = self.bot.get_channel(config.ANNOUNCEMENT_CHANNEL_ID)
-        if channel:
-            for uid, name in celebrants:
-                random_wish = random.choice(RANDOM_BIRTHDAY_WISHES)
-                embed = discord.Embed(
-                    title="🎉 Happy Birthday!",
-                    description=f"Happy Birthday to **{name}** (<@{uid}>)!",
-                    color=discord.Color.gold()
-                )
-                embed.add_field(
-                    name="A Special Birthday Wish For You",
-                    value=f"> *\"{random_wish}\"*",
-                    inline=False
-                )
-                await channel.send(content=f"🎂 <@{uid}>", embed=embed)
-
-    @check_birthdays.before_loop
-    async def before_check(self):
-        await self.bot.wait_until_ready()
-
-    @commands.command(name="birthday_panel")
-    @commands.has_permissions(administrator=True)
-    async def prefix_panel(self, ctx: commands.Context):
-        embed = await self.create_panel_embed()
-        await ctx.channel.send(embed=embed, view=CleanBirthdayView(self))
         try:
-            await ctx.message.delete()
+            channel = self.get_channel(backup_id) or await self.fetch_channel(backup_id)
+        except Exception:
+            return
+
+        b_count, c_count = 0, 0
+        try:
+            async with self.db.execute("SELECT COUNT(*) FROM birthdays") as c:
+                row = await c.fetchone()
+                b_count = row[0] if row else 0
+            async with self.db.execute("SELECT COUNT(*) FROM confessions") as c:
+                row = await c.fetchone()
+                c_count = row[0] if row else 0
         except Exception:
             pass
 
-    @app_commands.command(name="birthday_panel", description="Deploy the clean Birthday Panel.")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def slash_panel(self, interaction: discord.Interaction):
-        embed = await self.create_panel_embed()
-        await interaction.channel.send(embed=embed, view=CleanBirthdayView(self))
-        await interaction.response.send_message("Birthday panel deployed.", ephemeral=True)
+        if self.restore_report["success"]:
+            embed = discord.Embed(
+                title="🟢 Database Restored & Operational",
+                description="Project-Edith restarted. Storage synchronized from Discord backup.",
+                color=discord.Color.green(),
+                timestamp=datetime.now(timezone.utc)
+            )
+            embed.add_field(name="📦 Backup File", value=f"`{self.restore_report['filename']}`", inline=True)
+            embed.add_field(name="⚖️ Size", value=f"`{self.restore_report['filesize_kb']} KB`", inline=True)
+        else:
+            embed = discord.Embed(
+                title="🟡 Clean Database Initialized",
+                description="No historical snapshot found. Ready for first registrations.",
+                color=discord.Color.gold(),
+                timestamp=datetime.now(timezone.utc)
+            )
 
-async def setup(bot):
-    await bot.add_cog(Birthdays(bot))
+        embed.add_field(name="🎂 Restored Birthdays", value=f"`{b_count}` records", inline=True)
+        embed.add_field(name="🤫 Restored Confessions", value=f"`{c_count}` records", inline=True)
+        embed.set_footer(text=f"{self.user.name} • Persistent Cloud Storage")
+        await channel.send(embed=embed)
+
+    async def on_ready(self):
+        print(f"[READY] Operational as {self.user} (ID: {self.user.id})")
+        await self.change_presence(
+            activity=discord.Activity(type=discord.ActivityType.watching, name="over server | .help")
+        )
+
+        for guild in self.guilds:
+            layout_cog = self.get_cog("LayoutRemapping")
+            if layout_cog:
+                try:
+                    await layout_cog.setup_environment(guild)
+                except Exception as e:
+                    print(f"[LAYOUT SETUP ERROR] {e}")
+
+        await self.send_startup_embed()
+
+    async def close(self):
+        if self.db:
+            try:
+                await self.db.commit()
+                await self.db.close()
+            except Exception:
+                pass
+        await super().close()
+        await asyncio.sleep(0.5)
+
+bot = UtilityBot()
+
+async def main():
+    token = getattr(config, "TOKEN", None) or os.getenv("DISCORD_TOKEN")
+    if not token:
+        raise ValueError("CRITICAL: DISCORD_TOKEN is missing from config.py and environment variables.")
+    async with bot:
+        await bot.start(token)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("[SHUTDOWN] Bot process terminated cleanly.")
