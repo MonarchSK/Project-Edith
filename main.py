@@ -21,6 +21,7 @@ class UtilityBot(commands.Bot):
             help_command=None
         )
         self.db: aiosqlite.Connection = None
+        self._extensions_loaded = False
         self.restore_report = {
             "success": False,
             "filename": None,
@@ -30,17 +31,16 @@ class UtilityBot(commands.Bot):
         }
 
     async def restore_database_from_discord(self):
-        """Fetches the latest .db snapshot from #bot-memory before opening connection."""
+        """Scans the backup channel for the latest snapshot before DB initialization."""
         backup_id = int(os.getenv("BACKUP_CHANNEL_ID", getattr(config, "BACKUP_CHANNEL_ID", 0)))
         if not backup_id or backup_id == 0:
-            print("[RESTORE] BACKUP_CHANNEL_ID is unset or 0. Initializing fresh database.")
+            print("[RESTORE] BACKUP_CHANNEL_ID is unset or 0. Initializing clean database.")
             self.restore_report["is_fresh"] = True
             return
 
         try:
-            # Bot is already logged in during setup_hook; fetch directly with no recursive login() call
             channel = self.get_channel(backup_id) or await self.fetch_channel(backup_id)
-            print(f"[RESTORE] Scanning #{channel.name} for persistent database backups...")
+            print(f"[RESTORE] Scanning #{channel.name} for persistent backups...")
 
             async for message in channel.history(limit=50):
                 for attachment in message.attachments:
@@ -63,13 +63,13 @@ class UtilityBot(commands.Bot):
         self.restore_report["is_fresh"] = True
 
     async def setup_hook(self):
-        # 1. Download database snapshot BEFORE opening SQLite connection
+        # 1. Download database snapshot BEFORE opening local SQLite handle
         await self.restore_database_from_discord()
 
-        # 2. Establish connection to persistent or fresh local DB
+        # 2. Establish SQLite connection
         self.db = await aiosqlite.connect(DB_PATH)
 
-        # 3. Ensure essential schemas exist
+        # 3. Ensure base schemas
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS birthdays (
                 user_id INTEGER PRIMARY KEY,
@@ -87,36 +87,22 @@ class UtilityBot(commands.Bot):
         """)
         await self.db.commit()
 
-        # 4. Load all extensions from cogs directory
-        cogs_dir = os.path.join(os.path.dirname(__file__), "cogs")
-        if os.path.exists(cogs_dir):
-            for filename in os.listdir(cogs_dir):
-                if filename.endswith(".py") and not filename.startswith("__"):
-                    cog_name = f"cogs.{filename[:-3]}"
-                    try:
-                        await self.load_extension(cog_name)
-                        print(f"[COG LOADED] {cog_name}")
-                    except Exception as e:
-                        print(f"[COG ERROR] Failed loading {cog_name}: {e}", file=sys.stderr)
+        # 4. Load extensions safely once (NO circular imports)
+        if not self._extensions_loaded:
+            cogs_dir = os.path.join(os.path.dirname(__file__), "cogs")
+            if os.path.exists(cogs_dir):
+                for filename in sorted(os.listdir(cogs_dir)):
+                    if filename.endswith(".py") and not filename.startswith("__"):
+                        cog_name = f"cogs.{filename[:-3]}"
+                        if cog_name not in self.extensions:
+                            try:
+                                await self.load_extension(cog_name)
+                                print(f"[COG LOADED] {cog_name}")
+                            except Exception as e:
+                                print(f"[COG ERROR] Failed loading {cog_name}: {e}", file=sys.stderr)
+            self._extensions_loaded = True
 
-        # 5. Register persistent UI views so buttons survive restarts
-        from cogs.birthdays import CleanBirthdayView
-        from cogs.tickets import TicketPluginView, ActiveTicketControls
-        from cogs.confessions import ConfessionPluginView
-        from cogs.color_roles import ColorPluginPanel
-
-        bday_cog = self.get_cog("Birthdays")
-        if bday_cog:
-            self.add_view(CleanBirthdayView(bday_cog))
-        self.add_view(TicketPluginView())
-        self.add_view(ActiveTicketControls())
-        self.add_view(ConfessionPluginView(self))
-
-        color_cog = self.get_cog("ColorRoles")
-        if color_cog:
-            self.add_view(ColorPluginPanel(color_cog))
-
-        # 6. Synchronize application slash commands
+        # 5. Sync Slash Commands
         try:
             synced = await self.tree.sync()
             print(f"[SLASH] Synced {len(synced)} slash commands.")
