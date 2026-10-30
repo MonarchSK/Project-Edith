@@ -6,7 +6,6 @@ from discord import app_commands
 from discord.ext import commands, tasks
 import config
 
-# --- 10 Randomized Birthday Wishes ---
 RANDOM_BIRTHDAY_WISHES = [
     "Wishing you a year filled with happiness, health, and endless success! Have an amazing birthday! 🎂🎉",
     "May your day be as bright, joyful, and wonderful as you are! Happy Birthday! ✨🎈",
@@ -21,7 +20,6 @@ RANDOM_BIRTHDAY_WISHES = [
 ]
 
 def get_days_until(day: int, month: int) -> int:
-    """Accurately calculates remaining days until the next birthday."""
     today = date.today()
     try:
         target_this_year = date(today.year, month, day)
@@ -38,7 +36,6 @@ def get_days_until(day: int, month: int) -> int:
         return (target_next_year - today).days
 
 
-# --- Personal Registration Modal (Day & Month Only) ---
 class CleanBirthdayModal(discord.ui.Modal, title="Register Your Birthday"):
     day = discord.ui.TextInput(
         label="Day of Birth (1-31)",
@@ -84,12 +81,11 @@ class CleanBirthdayModal(discord.ui.Modal, title="Register Your Birthday"):
             f"• **Member:** {interaction.user.mention}\n"
             f"• **Date:** `{d:02d}/{m:02d}`\n"
             f"• **Countdown:** {countdown_text}\n"
-            f"• *Database backed up to `#bot-memory` automatically.*",
+            f"• *Database snapshot pushed to `#bot-memory`.*",
             ephemeral=True
         )
 
 
-# --- Master Override Modal (Day & Month Only) ---
 class MasterSetModal(discord.ui.Modal):
     def __init__(self, cog, target_member: discord.Member):
         super().__init__(title=f"Set Birthday: {target_member.name[:16]}")
@@ -134,12 +130,11 @@ class MasterSetModal(discord.ui.Modal):
             f"✅ **Birthday Added for {self.target_member.mention}!**\n"
             f"• **Date:** `{d:02d}/{m:02d}`\n"
             f"• **Days Left:** **{days_left}** days\n"
-            f"• *Database backed up to `#bot-memory` automatically.*",
+            f"• *Database snapshot pushed to `#bot-memory`.*",
             ephemeral=True
         )
 
 
-# --- User Select Dropdown for Master Control ---
 class DirectorMemberSelect(discord.ui.UserSelect):
     def __init__(self, cog):
         super().__init__(
@@ -161,7 +156,6 @@ class MasterUserPickerView(discord.ui.View):
         self.add_item(DirectorMemberSelect(cog))
 
 
-# --- Clean Birthday Panel View ---
 class CleanBirthdayView(discord.ui.View):
     def __init__(self, cog):
         super().__init__(timeout=None)
@@ -185,29 +179,48 @@ class CleanBirthdayView(discord.ui.View):
     async def check_bday(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
 
-        async with self.cog.bot.db.execute(
-            "SELECT user_name, day, month FROM birthdays WHERE user_id = ?",
-            (interaction.user.id,)
-        ) as cursor:
-            record = await cursor.fetchone()
+        try:
+            if not self.cog.bot.db:
+                await interaction.followup.send("⚠️ Database connection initializing. Try again in a few seconds.", ephemeral=True)
+                return
 
-        if record:
-            name, d, m = record[0], record[1], record[2]
-            days_left = get_days_until(d, m)
-            countdown_text = "🎉 **TODAY IS YOUR BIRTHDAY!**" if days_left == 0 else f"**{days_left}** days left"
+            await self.cog.bot.db.execute("""
+                CREATE TABLE IF NOT EXISTS birthdays (
+                    user_id INTEGER PRIMARY KEY,
+                    user_name TEXT,
+                    day INTEGER NOT NULL,
+                    month INTEGER NOT NULL
+                )
+            """)
+            await self.cog.bot.db.commit()
 
-            embed = discord.Embed(
-                title=f"🎂 Birthday Details: {name}",
-                color=discord.Color.blue()
-            )
-            embed.add_field(name="Date", value=f"`{d:02d}/{m:02d}`", inline=True)
-            embed.add_field(name="Countdown", value=countdown_text, inline=True)
-            await interaction.followup.send(embed=embed, ephemeral=True)
-        else:
-            await interaction.followup.send(
-                "❓ You haven't registered your birthday yet. Click **Set My Birthday** to add it!",
-                ephemeral=True
-            )
+            async with self.cog.bot.db.execute(
+                "SELECT user_name, day, month FROM birthdays WHERE user_id = ?",
+                (interaction.user.id,)
+            ) as cursor:
+                record = await cursor.fetchone()
+
+            if record:
+                name, d, m = record[0] or interaction.user.display_name, record[1], record[2]
+                days_left = get_days_until(d, m)
+                countdown_text = "🎉 **TODAY IS YOUR BIRTHDAY!**" if days_left == 0 else f"**{days_left}** days remaining"
+
+                embed = discord.Embed(
+                    title=f"🎂 Birthday Details: {name}",
+                    color=discord.Color.blue()
+                )
+                embed.add_field(name="Date", value=f"`{d:02d}/{m:02d}`", inline=True)
+                embed.add_field(name="Countdown", value=countdown_text, inline=True)
+                embed.set_footer(text="Registered in server database")
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            else:
+                await interaction.followup.send(
+                    "❓ You haven't registered your birthday yet. Click **Set My Birthday** to add it!",
+                    ephemeral=True
+                )
+        except Exception as e:
+            print(f"[CHECK BDAY ERROR] {e}")
+            await interaction.followup.send(f"⚠️ Error checking birthday: `{e}`", ephemeral=True)
 
     @discord.ui.button(
         label="Master Register",
@@ -222,13 +235,12 @@ class CleanBirthdayView(discord.ui.View):
             return
 
         await interaction.response.send_message(
-            "Select a member from the menu below:",
+            "Select a member from the dropdown below:",
             view=MasterUserPickerView(self.cog),
             ephemeral=True
         )
 
 
-# --- Birthday Cog ---
 class Birthdays(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -238,7 +250,6 @@ class Birthdays(commands.Cog):
         self.check_birthdays.cancel()
 
     async def trigger_auto_backup(self, trigger_user: str):
-        """Dispatches an instant backup job via the DiscordMemoryBackup cog."""
         backup_cog = self.bot.get_cog("DiscordMemoryBackup")
         if backup_cog and hasattr(backup_cog, "upload_backup_and_prune"):
             asyncio.create_task(
@@ -246,7 +257,6 @@ class Birthdays(commands.Cog):
             )
 
     async def save_birthday(self, user_id: int, user_name: str, day: int, month: int):
-        """Saves or updates birthday data, then executes instant auto-backup."""
         await self.bot.db.execute("""
             CREATE TABLE IF NOT EXISTS birthdays (
                 user_id INTEGER PRIMARY KEY,
@@ -266,7 +276,6 @@ class Birthdays(commands.Cog):
         """, (user_id, user_name, day, month))
         await self.bot.db.commit()
 
-        # Trigger automatic snapshot upload to #bot-memory
         await self.trigger_auto_backup(user_name)
 
     async def create_panel_embed(self) -> discord.Embed:
@@ -278,7 +287,6 @@ class Birthdays(commands.Cog):
         if config.BDAY_BANNER:
             embed.set_image(url=config.BDAY_BANNER)
 
-        # Show next 5 upcoming birthdays sorted by countdown
         roster_lines = []
         try:
             async with self.bot.db.execute("SELECT user_id, user_name, day, month FROM birthdays") as cursor:
@@ -304,7 +312,6 @@ class Birthdays(commands.Cog):
 
     @tasks.loop(hours=24)
     async def check_birthdays(self):
-        """Midnight cycle: picks a random wish from the 10-message pool for each celebrant."""
         now = datetime.now(timezone.utc)
         async with self.bot.db.execute(
             "SELECT user_id, user_name FROM birthdays WHERE day = ? AND month = ?",
@@ -335,11 +342,9 @@ class Birthdays(commands.Cog):
     async def before_check(self):
         await self.bot.wait_until_ready()
 
-    # --- Deployment Commands ---
     @commands.command(name="birthday_panel")
     @commands.has_permissions(administrator=True)
     async def prefix_panel(self, ctx: commands.Context):
-        """Deploy Birthday Panel: .birthday_panel"""
         embed = await self.create_panel_embed()
         await ctx.channel.send(embed=embed, view=CleanBirthdayView(self))
         try:
