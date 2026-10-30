@@ -30,16 +30,15 @@ class UtilityBot(commands.Bot):
         }
 
     async def restore_database_from_discord(self):
-        """Scans the designated backup channel and pulls down the latest valid .db file."""
+        """Fetches the latest .db snapshot from #bot-memory before opening connection."""
         backup_id = int(os.getenv("BACKUP_CHANNEL_ID", getattr(config, "BACKUP_CHANNEL_ID", 0)))
         if not backup_id or backup_id == 0:
             print("[RESTORE] BACKUP_CHANNEL_ID is unset or 0. Initializing fresh database.")
             self.restore_report["is_fresh"] = True
             return
 
-        token = getattr(config, "TOKEN", None) or os.getenv("DISCORD_TOKEN")
         try:
-            await self.login(token)
+            # Bot is already logged in during setup_hook; fetch directly with no recursive login() call
             channel = self.get_channel(backup_id) or await self.fetch_channel(backup_id)
             print(f"[RESTORE] Scanning #{channel.name} for persistent database backups...")
 
@@ -64,7 +63,7 @@ class UtilityBot(commands.Bot):
         self.restore_report["is_fresh"] = True
 
     async def setup_hook(self):
-        # 1. Download database snapshot BEFORE establishing active SQLite handle
+        # 1. Download database snapshot BEFORE opening SQLite connection
         await self.restore_database_from_discord()
 
         # 2. Establish connection to persistent or fresh local DB
