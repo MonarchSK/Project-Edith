@@ -30,21 +30,19 @@ class UtilityBot(commands.Bot):
         }
 
     async def restore_database_from_discord(self):
-        """Scans #bot-memory for the latest .db backup file before serving requests."""
-        if not config.BACKUP_CHANNEL_ID:
-            print("[RESTORE] BACKUP_CHANNEL_ID not configured. Initializing fresh database.")
+        """Downloads the latest SQLite backup from the backup channel before initializing tables."""
+        backup_id = int(os.getenv("BACKUP_CHANNEL_ID", getattr(config, "BACKUP_CHANNEL_ID", 0)))
+        if not backup_id or backup_id == 0:
+            print("[RESTORE] BACKUP_CHANNEL_ID is unset or 0. Initializing fresh database.")
             self.restore_report["is_fresh"] = True
             return
 
+        token = getattr(config, "TOKEN", None) or os.getenv("DISCORD_TOKEN")
         try:
-            channel = self.get_channel(config.BACKUP_CHANNEL_ID) or await self.fetch_channel(config.BACKUP_CHANNEL_ID)
-        except Exception as e:
-            print(f"[RESTORE ERROR] Could not reach backup channel {config.BACKUP_CHANNEL_ID}: {e}")
-            self.restore_report["is_fresh"] = True
-            return
+            await self.login(token)
+            channel = self.get_channel(backup_id) or await self.fetch_channel(backup_id)
+            print(f"[RESTORE] Scanning #{channel.name} for persistent database backups...")
 
-        print(f"[RESTORE] Scanning #{channel.name} for database snapshots...")
-        try:
             async for message in channel.history(limit=50):
                 for attachment in message.attachments:
                     if attachment.filename.endswith(".db"):
@@ -57,19 +55,22 @@ class UtilityBot(commands.Bot):
                             "filesize_kb": round(size_kb, 2),
                             "is_fresh": False
                         }
-                        print(f"[RESTORE] Database restored from '{attachment.filename}' ({round(size_kb, 2)} KB)")
+                        print(f"[RESTORE] Restored persistent storage from '{attachment.filename}' ({round(size_kb, 2)} KB)")
                         return
         except Exception as e:
-            print(f"[RESTORE ERROR] Scan failed: {e}")
+            print(f"[RESTORE ERROR] Could not retrieve snapshot: {e}")
 
-        print("[RESTORE] No previous snapshot located. Starting fresh database.")
+        print("[RESTORE] No prior backup file found in channel history. Starting fresh database.")
         self.restore_report["is_fresh"] = True
 
     async def setup_hook(self):
-        # 1. Connect local SQLite instance
+        # 1. Download database snapshot BEFORE establishing active SQLite handle
+        await self.restore_database_from_discord()
+
+        # 2. Establish connection to persistent or fresh local DB
         self.db = await aiosqlite.connect(DB_PATH)
 
-        # 2. Guarantee table structure
+        # 3. Ensure essential schemas exist
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS birthdays (
                 user_id INTEGER PRIMARY KEY,
@@ -87,7 +88,7 @@ class UtilityBot(commands.Bot):
         """)
         await self.db.commit()
 
-        # 3. Load modular extensions from cogs/
+        # 4. Load all extensions from cogs directory
         cogs_dir = os.path.join(os.path.dirname(__file__), "cogs")
         if os.path.exists(cogs_dir):
             for filename in os.listdir(cogs_dir):
@@ -99,7 +100,7 @@ class UtilityBot(commands.Bot):
                     except Exception as e:
                         print(f"[COG ERROR] Failed loading {cog_name}: {e}", file=sys.stderr)
 
-        # 4. Register Persistent Views (Buttons work even after restarts)
+        # 5. Register persistent UI views (ensures buttons work across bot restarts)
         from cogs.birthdays import CleanBirthdayView
         from cogs.tickets import TicketPluginView, ActiveTicketControls
         from cogs.confessions import ConfessionPluginView
@@ -116,19 +117,20 @@ class UtilityBot(commands.Bot):
         if color_cog:
             self.add_view(ColorPluginPanel(color_cog))
 
-        # 5. Sync Slash Commands
+        # 6. Synchronize application slash commands
         try:
             synced = await self.tree.sync()
-            print(f"[SLASH] Successfully synced {len(synced)} slash commands.")
+            print(f"[SLASH] Synced {len(synced)} slash commands.")
         except Exception as e:
-            print(f"[SLASH ERROR] Sync failed: {e}", file=sys.stderr)
+            print(f"[SLASH ERROR] Slash command sync failed: {e}", file=sys.stderr)
 
     async def send_startup_embed(self):
-        if not config.BACKUP_CHANNEL_ID:
+        backup_id = int(os.getenv("BACKUP_CHANNEL_ID", getattr(config, "BACKUP_CHANNEL_ID", 0)))
+        if not backup_id or backup_id == 0:
             return
 
         try:
-            channel = self.get_channel(config.BACKUP_CHANNEL_ID) or await self.fetch_channel(config.BACKUP_CHANNEL_ID)
+            channel = self.get_channel(backup_id) or await self.fetch_channel(backup_id)
         except Exception:
             return
 
@@ -146,7 +148,7 @@ class UtilityBot(commands.Bot):
         if self.restore_report["success"]:
             embed = discord.Embed(
                 title="🟢 Database Restored & Operational",
-                description="Project-Edith restarted. Storage synchronized from Discord cloud backup.",
+                description="Project-Edith restarted. Storage synchronized from Discord backup.",
                 color=discord.Color.green(),
                 timestamp=datetime.now(timezone.utc)
             )
@@ -167,10 +169,6 @@ class UtilityBot(commands.Bot):
 
     async def on_ready(self):
         print(f"[READY] Operational as {self.user} (ID: {self.user.id})")
-
-        # Database cloud sync check on boot
-        await self.restore_database_from_discord()
-
         await self.change_presence(
             activity=discord.Activity(type=discord.ActivityType.watching, name="over server | .help")
         )
@@ -186,7 +184,7 @@ class UtilityBot(commands.Bot):
         await self.send_startup_embed()
 
     async def close(self):
-        """Gracefully commits SQLite and flushes active aiohttp sessions."""
+        """Commits data and allows lingering HTTP/SSL transports to terminate gracefully."""
         if self.db:
             try:
                 await self.db.commit()
@@ -199,13 +197,13 @@ class UtilityBot(commands.Bot):
 bot = UtilityBot()
 
 async def main():
+    token = getattr(config, "TOKEN", None) or os.getenv("DISCORD_TOKEN")
+    if not token:
+        raise ValueError("CRITICAL: DISCORD_TOKEN is missing from config.py and environment variables.")
     async with bot:
-        await bot.start(config.TOKEN)
+        await bot.start(token)
 
 if __name__ == "__main__":
-    if not config.TOKEN:
-        raise ValueError("CRITICAL: DISCORD_TOKEN is missing from your environment variables.")
-
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
