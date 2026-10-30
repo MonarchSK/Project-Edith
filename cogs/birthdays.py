@@ -36,7 +36,6 @@ def get_days_until(day: int, month: int) -> int:
         return (target_next_year - today).days
 
 
-# --- Personal Registration Modal ---
 class CleanBirthdayModal(discord.ui.Modal, title="Register Your Birthday"):
     day = discord.ui.TextInput(
         label="Day of Birth (1-31)",
@@ -58,7 +57,6 @@ class CleanBirthdayModal(discord.ui.Modal, title="Register Your Birthday"):
         self.cog = cog
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Acknowledge immediately within milliseconds
         await interaction.response.defer(ephemeral=True)
 
         try:
@@ -90,7 +88,6 @@ class CleanBirthdayModal(discord.ui.Modal, title="Register Your Birthday"):
             await interaction.followup.send(f"⚠️ Failed to save birthday: `{e}`", ephemeral=True)
 
 
-# --- Master Override Modal ---
 class MasterSetModal(discord.ui.Modal):
     def __init__(self, cog, target_member: discord.Member):
         super().__init__(title=f"Set Birthday: {target_member.name[:16]}")
@@ -143,7 +140,6 @@ class MasterSetModal(discord.ui.Modal):
             await interaction.followup.send(f"⚠️ Failed to save birthday: `{e}`", ephemeral=True)
 
 
-# --- User Select Dropdown for Master Control ---
 class DirectorMemberSelect(discord.ui.UserSelect):
     def __init__(self, cog):
         super().__init__(
@@ -171,7 +167,6 @@ class MasterUserPickerView(discord.ui.View):
         self.add_item(DirectorMemberSelect(cog))
 
 
-# --- Main Clean Dashboard Buttons ---
 class CleanBirthdayView(discord.ui.View):
     def __init__(self, cog):
         super().__init__(timeout=None)
@@ -189,7 +184,7 @@ class CleanBirthdayView(discord.ui.View):
         except Exception as e:
             print(f"[MODAL LAUNCH ERROR] {e}")
             if not interaction.response.is_done():
-                await interaction.response.send_message(f"⚠️ Failed to open registration modal: `{e}`", ephemeral=True)
+                await interaction.response.send_message(f"⚠️ Failed to open modal: `{e}`", ephemeral=True)
 
     @discord.ui.button(
         label="Check Birthday",
@@ -296,11 +291,14 @@ class CleanBirthdayView(discord.ui.View):
                 await interaction.response.send_message(f"⚠️ Error: `{e}`", ephemeral=True)
 
 
-# --- Birthday Cog Engine ---
 class Birthdays(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.check_birthdays.start()
+
+    async def cog_load(self):
+        """Self-registers persistent view when loaded, preventing circular imports in main.py."""
+        self.bot.add_view(CleanBirthdayView(self))
 
     def cog_unload(self):
         self.check_birthdays.cancel()
@@ -363,7 +361,7 @@ class Birthdays(commands.Cog):
         if roster_lines:
             embed.add_field(name="Upcoming Birthdays", value="\n".join(roster_lines), inline=False)
 
-        embed.set_footer(text="Click 'Set My Birthday' to get started")
+        embed.set_footer(text="Click 'Check Birthday' to see all member countdowns")
         return embed
 
     @tasks.loop(hours=24)
