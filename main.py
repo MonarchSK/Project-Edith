@@ -28,9 +28,10 @@ class UtilityBot(commands.Bot):
             "filesize_kb": 0.0,
             "is_fresh": False
         }
+        self.initialized = False
 
     async def restore_database_from_discord(self):
-        """Scans the designated backup channel and pulls down the latest valid .db file."""
+        """Scans the backup channel and restores the latest snapshot."""
         if not config.BACKUP_CHANNEL_ID:
             print("[RESTORE] BACKUP_CHANNEL_ID not set. Starting fresh.")
             self.restore_report["is_fresh"] = True
@@ -44,33 +45,32 @@ class UtilityBot(commands.Bot):
             return
 
         print(f"[RESTORE] Searching #{channel.name} for latest database snapshots...")
-        async for message in channel.history(limit=50):
-            for attachment in message.attachments:
-                if attachment.filename.endswith(".db"):
-                    await attachment.save(DB_PATH)
-                    size_kb = os.path.getsize(DB_PATH) / 1024
-                    self.restore_report = {
-                        "success": True,
-                        "filename": attachment.filename,
-                        "timestamp": message.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
-                        "filesize_kb": round(size_kb, 2),
-                        "is_fresh": False
-                    }
-                    print(f"[RESTORE] Database restored from file '{attachment.filename}'")
-                    return
+        try:
+            async for message in channel.history(limit=50):
+                for attachment in message.attachments:
+                    if attachment.filename.endswith(".db"):
+                        await attachment.save(DB_PATH)
+                        size_kb = os.path.getsize(DB_PATH) / 1024
+                        self.restore_report = {
+                            "success": True,
+                            "filename": attachment.filename,
+                            "timestamp": message.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                            "filesize_kb": round(size_kb, 2),
+                            "is_fresh": False
+                        }
+                        print(f"[RESTORE] Database restored from '{attachment.filename}'")
+                        return
+        except Exception as e:
+            print(f"[RESTORE ERROR] Failed during history scan: {e}")
 
         print("[RESTORE] No prior backup file found. Initializing clean database.")
         self.restore_report["is_fresh"] = True
 
     async def setup_hook(self):
-        # 1. Establish Discord connection & download cloud database
-        await self.login(config.TOKEN)
-        await self.restore_database_from_discord()
-
-        # 2. Open SQLite on the restored (or freshly initialized) file
+        # 1. Connect local SQLite database
         self.db = await aiosqlite.connect(DB_PATH)
 
-        # 3. Verify core schema
+        # 2. Verify tables
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS birthdays (
                 user_id INTEGER PRIMARY KEY,
@@ -87,7 +87,7 @@ class UtilityBot(commands.Bot):
         """)
         await self.db.commit()
 
-        # 4. Load all cogs from /cogs
+        # 3. Load all cogs
         cogs_dir = os.path.join(os.path.dirname(__file__), "cogs")
         if os.path.exists(cogs_dir):
             for filename in os.listdir(cogs_dir):
@@ -99,7 +99,7 @@ class UtilityBot(commands.Bot):
                     except Exception as e:
                         print(f"[ERROR] Failed loading {cog_name}: {e}", file=sys.stderr)
 
-        # 5. Sync Slash commands
+        # 4. Sync slash commands
         try:
             synced = await self.tree.sync()
             print(f"[SLASH] Synced {len(synced)} slash commands.")
@@ -107,7 +107,6 @@ class UtilityBot(commands.Bot):
             print(f"[SLASH ERROR] Sync failed: {e}", file=sys.stderr)
 
     async def send_startup_embed(self):
-        """Sends startup diagnostic report into the memory channel."""
         if not config.BACKUP_CHANNEL_ID:
             return
 
@@ -130,17 +129,16 @@ class UtilityBot(commands.Bot):
         if self.restore_report["success"]:
             embed = discord.Embed(
                 title="🟢 Database Restored & Operational",
-                description="Project-Edith deployment completed. State retrieved from cloud Discord storage.",
+                description="Project-Edith deployment completed. State retrieved from Discord memory.",
                 color=discord.Color.green(),
                 timestamp=datetime.now(timezone.utc)
             )
             embed.add_field(name="📦 Backup File", value=f"`{self.restore_report['filename']}`", inline=True)
             embed.add_field(name="⚖️ Size", value=f"`{self.restore_report['filesize_kb']} KB`", inline=True)
-            embed.add_field(name="🕒 Origin Timestamp", value=f"`{self.restore_report['timestamp']}`", inline=False)
         else:
             embed = discord.Embed(
                 title="🟡 Clean Database Initialized",
-                description="No historical snapshot found. Ready for initial registrations.",
+                description="No historical snapshot found. Ready for first registrations.",
                 color=discord.Color.gold(),
                 timestamp=datetime.now(timezone.utc)
             )
@@ -151,7 +149,15 @@ class UtilityBot(commands.Bot):
         await channel.send(embed=embed)
 
     async def on_ready(self):
+        if self.initialized:
+            return
+        self.initialized = True
+
         print(f"[READY] Operational as {self.user} (ID: {self.user.id})")
+
+        # Restore from channel once bot is logged in
+        await self.restore_database_from_discord()
+
         await self.change_presence(
             activity=discord.Activity(type=discord.ActivityType.watching, name="over server | .help")
         )
@@ -159,34 +165,25 @@ class UtilityBot(commands.Bot):
         for guild in self.guilds:
             layout_cog = self.get_cog("LayoutRemapping")
             if layout_cog:
-                await layout_cog.setup_environment(guild)
+                try:
+                    await layout_cog.setup_environment(guild)
+                except Exception as e:
+                    print(f"[LAYOUT ERROR] {e}")
 
         await self.send_startup_embed()
 
     async def close(self):
-        """Cleanly tears down connections and gives SSL transports time to close."""
         if self.db:
             try:
                 await self.db.commit()
                 await self.db.close()
             except Exception:
                 pass
-
         await super().close()
-        # Brief pause to allow underlying aiohttp client sessions & SSL transports to flush and disconnect cleanly
-        await asyncio.sleep(0.5)
 
 bot = UtilityBot()
-
-async def main():
-    async with bot:
-        await bot.start(config.TOKEN)
 
 if __name__ == "__main__":
     if not config.TOKEN:
         raise ValueError("CRITICAL: DISCORD_TOKEN is missing in environment.")
-
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        print("\n[SHUTDOWN] Bot process terminated cleanly.")
+    bot.run(config.TOKEN)
