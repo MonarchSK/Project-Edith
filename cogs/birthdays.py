@@ -58,6 +58,7 @@ class CleanBirthdayModal(discord.ui.Modal, title="Register Your Birthday"):
         self.cog = cog
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Acknowledge immediately within milliseconds
         await interaction.response.defer(ephemeral=True)
 
         try:
@@ -72,19 +73,21 @@ class CleanBirthdayModal(discord.ui.Modal, title="Register Your Birthday"):
             return
 
         user_name = interaction.user.display_name
-        await self.cog.save_birthday(interaction.user.id, user_name, d, m)
-        days_left = get_days_until(d, m)
+        try:
+            await self.cog.save_birthday(interaction.user.id, user_name, d, m)
+            days_left = get_days_until(d, m)
+            countdown_text = "🎉 **Your birthday is TODAY!**" if days_left == 0 else f"**{days_left}** days remaining"
 
-        countdown_text = "🎉 **Your birthday is TODAY!**" if days_left == 0 else f"**{days_left}** days remaining"
-
-        await interaction.followup.send(
-            f"✅ **Birthday Registered!**\n"
-            f"• **Member:** {interaction.user.mention}\n"
-            f"• **Date:** `{d:02d}/{m:02d}`\n"
-            f"• **Countdown:** {countdown_text}\n"
-            f"• *Database snapshot pushed to `#bot-memory`.*",
-            ephemeral=True
-        )
+            await interaction.followup.send(
+                f"✅ **Birthday Registered!**\n"
+                f"• **Member:** {interaction.user.mention}\n"
+                f"• **Date:** `{d:02d}/{m:02d}`\n"
+                f"• **Countdown:** {countdown_text}",
+                ephemeral=True
+            )
+        except Exception as e:
+            print(f"[SAVE BDAY ERROR] {e}")
+            await interaction.followup.send(f"⚠️ Failed to save birthday: `{e}`", ephemeral=True)
 
 
 # --- Master Override Modal ---
@@ -125,16 +128,19 @@ class MasterSetModal(discord.ui.Modal):
             await interaction.followup.send("❌ Invalid date values.", ephemeral=True)
             return
 
-        await self.cog.save_birthday(self.target_member.id, self.target_member.display_name, d, m)
-        days_left = get_days_until(d, m)
+        try:
+            await self.cog.save_birthday(self.target_member.id, self.target_member.display_name, d, m)
+            days_left = get_days_until(d, m)
 
-        await interaction.followup.send(
-            f"✅ **Birthday Added for {self.target_member.mention}!**\n"
-            f"• **Date:** `{d:02d}/{m:02d}`\n"
-            f"• **Days Left:** **{days_left}** days\n"
-            f"• *Database snapshot pushed to `#bot-memory`.*",
-            ephemeral=True
-        )
+            await interaction.followup.send(
+                f"✅ **Birthday Added for {self.target_member.mention}!**\n"
+                f"• **Date:** `{d:02d}/{m:02d}`\n"
+                f"• **Days Left:** **{days_left}** days",
+                ephemeral=True
+            )
+        except Exception as e:
+            print(f"[MASTER SAVE ERROR] {e}")
+            await interaction.followup.send(f"⚠️ Failed to save birthday: `{e}`", ephemeral=True)
 
 
 # --- User Select Dropdown for Master Control ---
@@ -143,19 +149,25 @@ class DirectorMemberSelect(discord.ui.UserSelect):
         super().__init__(
             placeholder="Choose a server member to set their birthday...",
             min_values=1,
-            max_values=1
+            max_values=1,
+            custom_id="bday_director_select"
         )
         self.cog = cog
 
     async def callback(self, interaction: discord.Interaction):
-        selected_user = self.values[0]
-        member = interaction.guild.get_member(selected_user.id) or selected_user
-        await interaction.response.send_modal(MasterSetModal(self.cog, member))
+        try:
+            selected_user = self.values[0]
+            member = interaction.guild.get_member(selected_user.id) or selected_user
+            await interaction.response.send_modal(MasterSetModal(self.cog, member))
+        except Exception as e:
+            print(f"[MEMBER SELECT ERROR] {e}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(f"⚠️ Error: `{e}`", ephemeral=True)
 
 
 class MasterUserPickerView(discord.ui.View):
     def __init__(self, cog):
-        super().__init__(timeout=60)
+        super().__init__(timeout=120)
         self.add_item(DirectorMemberSelect(cog))
 
 
@@ -172,7 +184,12 @@ class CleanBirthdayView(discord.ui.View):
         custom_id="bday_set_clean"
     )
     async def set_bday(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(CleanBirthdayModal(self.cog))
+        try:
+            await interaction.response.send_modal(CleanBirthdayModal(self.cog))
+        except Exception as e:
+            print(f"[MODAL LAUNCH ERROR] {e}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(f"⚠️ Failed to open registration modal: `{e}`", ephemeral=True)
 
     @discord.ui.button(
         label="Check Birthday",
@@ -198,7 +215,6 @@ class CleanBirthdayView(discord.ui.View):
             """)
             await self.cog.bot.db.commit()
 
-            # Retrieve all birthdays from the database
             async with self.cog.bot.db.execute("SELECT user_id, user_name, day, month FROM birthdays") as cursor:
                 records = await cursor.fetchall()
 
@@ -206,7 +222,6 @@ class CleanBirthdayView(discord.ui.View):
                 await interaction.followup.send("📅 No birthdays have been registered yet! Click **Set My Birthday** to be the first.", ephemeral=True)
                 return
 
-            # Enrich and sort all birthdays by days remaining
             enriched_list = []
             for uid, name, d, m in records:
                 days = get_days_until(d, m)
@@ -232,10 +247,8 @@ class CleanBirthdayView(discord.ui.View):
                 display_title = name or f"User {uid}"
                 lines.append(f"• **{display_title}** (<@{uid}>) — `{d:02d}/{m:02d}` ({badge})")
 
-            # Format lines (Discord embed field value limit is 1024 characters)
             field_text = "\n".join(lines)
             if len(field_text) > 1024:
-                # Split cleanly if there are many entries
                 parts = []
                 current_part = ""
                 for line in lines:
@@ -271,11 +284,16 @@ class CleanBirthdayView(discord.ui.View):
             await interaction.response.send_message("⛔ Only Directors and Admins can use Master Register.", ephemeral=True)
             return
 
-        await interaction.response.send_message(
-            "Select a member from the dropdown below:",
-            view=MasterUserPickerView(self.cog),
-            ephemeral=True
-        )
+        try:
+            await interaction.response.send_message(
+                "Select a member from the dropdown below:",
+                view=MasterUserPickerView(self.cog),
+                ephemeral=True
+            )
+        except Exception as e:
+            print(f"[MASTER BUTTON ERROR] {e}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(f"⚠️ Error: `{e}`", ephemeral=True)
 
 
 # --- Birthday Cog Engine ---
@@ -287,7 +305,7 @@ class Birthdays(commands.Cog):
     def cog_unload(self):
         self.check_birthdays.cancel()
 
-    async def trigger_auto_backup(self, trigger_user: str):
+    def trigger_auto_backup(self, trigger_user: str):
         backup_cog = self.bot.get_cog("DiscordMemoryBackup")
         if backup_cog and hasattr(backup_cog, "upload_backup_and_prune"):
             asyncio.create_task(
@@ -314,7 +332,7 @@ class Birthdays(commands.Cog):
         """, (user_id, user_name, day, month))
         await self.bot.db.commit()
 
-        await self.trigger_auto_backup(user_name)
+        self.trigger_auto_backup(user_name)
 
     async def create_panel_embed(self) -> discord.Embed:
         embed = discord.Embed(
@@ -345,7 +363,7 @@ class Birthdays(commands.Cog):
         if roster_lines:
             embed.add_field(name="Upcoming Birthdays", value="\n".join(roster_lines), inline=False)
 
-        embed.set_footer(text="Click 'Check Birthday' to see all member countdowns")
+        embed.set_footer(text="Click 'Set My Birthday' to get started")
         return embed
 
     @tasks.loop(hours=24)
