@@ -9,7 +9,6 @@ ANNOUNCEMENT_CHANNEL_ID = int(os.getenv("ANNOUNCEMENT_CHANNEL_ID", "0"))
 CONFESSION_CHANNEL_ID = int(os.getenv("CONFESSION_CHANNEL_ID", "0"))
 DIRECTOR_ROLE_NAME = "Director"
 
-# Verified Direct Asset URLs (guaranteed raw image format)
 DEFAULT_ICON = "https://cdn.discordapp.com/emojis/853989392277569566.gif?quality=lossless"
 TICKET_BANNER = "https://images.unsplash.com/photo-1517245386807-bb43f82c33c4?auto=format&fit=crop&w=1000&q=80"
 BDAY_BANNER = "https://images.unsplash.com/photo-1513151233558-d860c5398176?auto=format&fit=crop&w=1000&q=80"
