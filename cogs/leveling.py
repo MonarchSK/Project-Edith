@@ -1,6 +1,7 @@
 import time
 import math
 import random
+import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -13,6 +14,12 @@ MSG_XP_MIN = 15
 MSG_XP_MAX = 25
 VOICE_XP_PER_MINUTE = 10
 BOOSTER_XP_MULTIPLIER = 1.5  # 1.5x XP Boost for Server Boosters
+
+# Random XP Drop Settings
+DROP_CHANCE = 0.03            # 3% chance per eligible chat message
+DROP_XP_MIN = 10
+DROP_XP_MAX = 1000
+DROP_TIMEOUT_SECONDS = 90     # Despawns after 90 seconds if unclaimed
 
 # Milestone rewards mapping: level -> (role_name, role_color_hex)
 MILESTONE_ROLES = {
@@ -47,6 +54,65 @@ def is_server_booster(member: discord.Member) -> bool:
     if not isinstance(member, discord.Member):
         return False
     return member.premium_since is not None
+
+
+# --- Interactive Random XP Drop View ---
+class XpDropClaimView(discord.ui.View):
+    def __init__(self, cog, xp_amount: int):
+        super().__init__(timeout=DROP_TIMEOUT_SECONDS)
+        self.cog = cog
+        self.xp_amount = xp_amount
+        self.claimed = False
+        self.message = None
+
+    @discord.ui.button(label="Claim XP Drop", style=discord.ButtonStyle.success, emoji="🎁", custom_id="btn_claim_xp_drop")
+    async def claim_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.claimed:
+            await interaction.response.send_message("❌ This XP Drop has already been claimed!", ephemeral=True)
+            return
+
+        self.claimed = True
+        button.disabled = True
+        button.label = f"Claimed by {interaction.user.display_name[:16]}"
+        button.style = discord.ButtonStyle.secondary
+
+        user = interaction.user
+        awarded_xp = self.xp_amount
+        if is_server_booster(user):
+            awarded_xp = math.ceil(self.xp_amount * BOOSTER_XP_MULTIPLIER)
+
+        # Award XP directly to claimer
+        await self.cog.add_xp(user, self.xp_amount, reason="Random XP Drop Claim", channel=interaction.channel)
+
+        # Update drop message embed
+        embed = discord.Embed(
+            title="🎁 XP Drop Claimed!",
+            description=(
+                f"**{user.mention}** reacted first and claimed **+{self.xp_amount} XP**!\n"
+                + (f"🚀 *Booster 1.5x Multiplier applied: Received **+{awarded_xp} XP**!*" if is_server_booster(user) else "")
+            ),
+            color=discord.Color.gold(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.set_thumbnail(url=user.display_avatar.url)
+        embed.set_footer(text="Project-Edith • Supply Drop Claimed")
+
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def on_timeout(self):
+        if not self.claimed and self.message:
+            for child in self.children:
+                child.disabled = True
+                child.label = "Expired"
+            embed = discord.Embed(
+                title="📦 XP Drop Expired",
+                description="Nobody claimed this supply drop in time. Better luck next time!",
+                color=discord.Color.dark_grey()
+            )
+            try:
+                await self.message.edit(embed=embed, view=self)
+            except Exception:
+                pass
 
 
 class Leveling(commands.Cog):
@@ -124,7 +190,6 @@ class Leveling(commands.Cog):
         if user.bot or not isinstance(user, discord.Member):
             return
 
-        # Apply 1.5x Multiplier for Boosters
         final_xp = amount
         if is_server_booster(user):
             final_xp = math.ceil(amount * BOOSTER_XP_MULTIPLIER)
@@ -205,7 +270,39 @@ class Leveling(commands.Cog):
                 except Exception:
                     pass
 
-    # --- Text Message XP Listener ---
+    async def trigger_xp_drop(self, channel: discord.TextChannel, amount: int = None):
+        """Spawns an interactive XP drop into the designated channel."""
+        drop_val = amount or random.randint(DROP_XP_MIN, DROP_XP_MAX)
+
+        if drop_val >= 600:
+            rarity = "🌟 LEGENDARY SUPPLY CRATE"
+            color = discord.Color.gold()
+        elif drop_val >= 250:
+            rarity = "💎 RARE XP CACHE"
+            color = discord.Color.purple()
+        else:
+            rarity = "📦 XP SUPPLY DROP"
+            color = discord.Color.teal()
+
+        embed = discord.Embed(
+            title=rarity,
+            description=(
+                f"A wild supply drop has appeared in chat!\n\n"
+                f"• **Potential Reward:** **`+{drop_val} XP`**\n"
+                f"• **Status:** Unclaimed\n"
+                f"• **Instruction:** Click the button below first to claim it!\n"
+                f"*(Disappears <t:{int(time.time()) + DROP_TIMEOUT_SECONDS}:R>)*"
+            ),
+            color=color,
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.set_footer(text="Project-Edith • Random Supply Drops")
+
+        view = XpDropClaimView(self, drop_val)
+        msg = await channel.send(embed=embed, view=view)
+        view.message = msg
+
+    # --- Text Message XP Listener with Random Drop Trigger ---
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot or not message.guild:
@@ -230,6 +327,10 @@ class Leveling(commands.Cog):
         await self.bot.db.commit()
 
         await self.add_xp(message.author, base_xp, reason="Message XP", channel=message.channel)
+
+        # Roll for Random XP Drop Chance
+        if random.random() < DROP_CHANCE:
+            asyncio.create_task(self.trigger_xp_drop(message.channel))
 
     # --- Voice State Listener & XP Tracker ---
     @commands.Cog.listener()
@@ -424,7 +525,34 @@ class Leveling(commands.Cog):
         embed.set_footer(text="Project-Edith • Leveling Matrix")
         await interaction.response.send_message(embed=embed)
 
-    # --- Director Master Command to Manually Set Levels ---
+    # --- Manual Drop Command (Admin / Director) ---
+    @commands.command(name="dropxp")
+    @commands.has_permissions(administrator=True)
+    async def manual_drop_cmd(self, ctx: commands.Context, amount: int = None):
+        """Spawn a manual XP Drop: .dropxp or .dropxp 500"""
+        if amount and not (10 <= amount <= 1000):
+            await ctx.send("❌ XP Drop amount must be between 10 and 1,000 XP.")
+            return
+
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
+
+        await self.trigger_xp_drop(ctx.channel, amount)
+
+    @app_commands.command(name="dropxp", description="Spawn an interactive XP Drop in the current channel.")
+    @app_commands.describe(amount="Custom XP amount (10-1000). Leave blank for random.")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def slash_manual_drop(self, interaction: discord.Interaction, amount: int = None):
+        if amount and not (10 <= amount <= 1000):
+            await interaction.response.send_message("❌ XP Drop amount must be between 10 and 1,000 XP.", ephemeral=True)
+            return
+
+        await interaction.response.send_message("🎁 Spawning supply drop...", ephemeral=True)
+        await self.trigger_xp_drop(interaction.channel, amount)
+
+    # --- Set Level Command ---
     @commands.command(name="setlevel")
     @commands.has_permissions(administrator=True)
     async def set_level_cmd(self, ctx: commands.Context, member: discord.Member, target_level: int):
