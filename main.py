@@ -12,6 +12,7 @@ DB_PATH = "bot_database.db"
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
+intents.voice_states = True
 
 class UtilityBot(commands.Bot):
     def __init__(self):
@@ -69,7 +70,7 @@ class UtilityBot(commands.Bot):
         # 2. Establish SQLite connection
         self.db = await aiosqlite.connect(DB_PATH)
 
-        # 3. Ensure base schemas exist
+        # 3. Ensure all table schemas exist
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS birthdays (
                 user_id INTEGER PRIMARY KEY,
@@ -83,6 +84,25 @@ class UtilityBot(commands.Bot):
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 content TEXT NOT NULL,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS levels (
+                user_id INTEGER PRIMARY KEY,
+                user_name TEXT,
+                xp INTEGER DEFAULT 0,
+                level INTEGER DEFAULT 1,
+                messages_count INTEGER DEFAULT 0,
+                voice_minutes INTEGER DEFAULT 0
+            )
+        """)
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS bump_status (
+                guild_id INTEGER PRIMARY KEY,
+                last_bump_timestamp INTEGER DEFAULT 0,
+                last_bumper_id INTEGER DEFAULT 0,
+                reminder_sent INTEGER DEFAULT 1,
+                last_channel_id INTEGER DEFAULT 0
             )
         """)
         await self.db.commit()
@@ -119,11 +139,14 @@ class UtilityBot(commands.Bot):
         except Exception:
             return
 
-        b_count, c_count = 0, 0
+        b_count, l_count, c_count = 0, 0, 0
         try:
             async with self.db.execute("SELECT COUNT(*) FROM birthdays") as c:
                 row = await c.fetchone()
                 b_count = row[0] if row else 0
+            async with self.db.execute("SELECT COUNT(*) FROM levels") as c:
+                row = await c.fetchone()
+                l_count = row[0] if row else 0
             async with self.db.execute("SELECT COUNT(*) FROM confessions") as c:
                 row = await c.fetchone()
                 c_count = row[0] if row else 0
@@ -142,13 +165,14 @@ class UtilityBot(commands.Bot):
         else:
             embed = discord.Embed(
                 title="🟡 Clean Database Initialized",
-                description="No historical snapshot found. Ready for first registrations.",
+                description="No historical snapshot found. Ready for registrations & activity.",
                 color=discord.Color.gold(),
                 timestamp=datetime.now(timezone.utc)
             )
 
-        embed.add_field(name="🎂 Restored Birthdays", value=f"`{b_count}` records", inline=True)
-        embed.add_field(name="🤫 Restored Confessions", value=f"`{c_count}` records", inline=True)
+        embed.add_field(name="🎂 Birthdays", value=f"`{b_count}`", inline=True)
+        embed.add_field(name="📊 Tracked Members", value=f"`{l_count}`", inline=True)
+        embed.add_field(name="🤫 Confessions", value=f"`{c_count}`", inline=True)
         embed.set_footer(text=f"{self.user.name} • Persistent Cloud Storage")
         await channel.send(embed=embed)
 
