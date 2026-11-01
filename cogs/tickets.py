@@ -91,9 +91,9 @@ def extract_creator_id(topic: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-# --- Helper: Create Isolated, Locked Channel ---
+# --- Helper: Create Isolated, Locked Channel with Staff Role Ping ---
 async def create_locked_channel(interaction: discord.Interaction, prefix: str, title: str, fields: list[tuple[str, str]], color: discord.Color):
-    """Provisions a private channel visible ONLY to the user, Directors, and Admins."""
+    """Provisions a private channel visible ONLY to the user, Directors, and Admins, and alerts staff."""
     guild = interaction.guild
     member = interaction.user
     timestamp = datetime.now(timezone.utc).strftime("%H%M")
@@ -105,12 +105,14 @@ async def create_locked_channel(interaction: discord.Interaction, prefix: str, t
         guild.me: discord.PermissionOverwrite(view_channel=True, read_messages=True, send_messages=True, manage_channels=True)
     }
 
+    # Locate Director role
     director_role = discord.utils.get(guild.roles, name=config.DIRECTOR_ROLE_NAME)
     if director_role:
         overwrites[director_role] = discord.PermissionOverwrite(
             view_channel=True, read_messages=True, send_messages=True, manage_channels=True
         )
 
+    # Permit server administrators
     for role in guild.roles:
         if role.permissions.administrator or role.name.lower() in ["admin", "administrator", "head mod"]:
             overwrites[role] = discord.PermissionOverwrite(view_channel=True, read_messages=True, send_messages=True)
@@ -133,10 +135,17 @@ async def create_locked_channel(interaction: discord.Interaction, prefix: str, t
 
     embed.set_footer(text="Project-Edith • Private Dispatch")
 
+    # Build ping content: alert both the user and the Director role
+    if director_role:
+        notification_content = f"🔔 Notification: {member.mention} | {director_role.mention}"
+    else:
+        notification_content = f"🔔 Notification: {member.mention} | *(Director role `{config.DIRECTOR_ROLE_NAME}` not found)*"
+
     await channel.send(
-        content=f"🔔 Notification: {member.mention}",
+        content=notification_content,
         embed=embed,
-        view=ActiveTicketControls()
+        view=ActiveTicketControls(),
+        allowed_mentions=discord.AllowedMentions(roles=True, users=True)
     )
     return channel
 
