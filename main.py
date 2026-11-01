@@ -34,7 +34,7 @@ class UtilityBot(commands.Bot):
         """Scans the backup channel for the latest snapshot before DB initialization."""
         backup_id = int(os.getenv("BACKUP_CHANNEL_ID", getattr(config, "BACKUP_CHANNEL_ID", 0)))
         if not backup_id or backup_id == 0:
-            print("[RESTORE] BACKUP_CHANNEL_ID is unset or 0. Initializing clean database.")
+            print("[RESTORE] BACKUP_CHANNEL_ID is unset or 0. Initializing fresh database.")
             self.restore_report["is_fresh"] = True
             return
 
@@ -69,7 +69,7 @@ class UtilityBot(commands.Bot):
         # 2. Establish SQLite connection
         self.db = await aiosqlite.connect(DB_PATH)
 
-        # 3. Ensure base schemas
+        # 3. Ensure base schemas exist
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS birthdays (
                 user_id INTEGER PRIMARY KEY,
@@ -87,7 +87,7 @@ class UtilityBot(commands.Bot):
         """)
         await self.db.commit()
 
-        # 4. Load extensions safely once (NO circular imports)
+        # 4. Load extensions safely once (NO circular imports, views self-register in cog_load)
         if not self._extensions_loaded:
             cogs_dir = os.path.join(os.path.dirname(__file__), "cogs")
             if os.path.exists(cogs_dir):
