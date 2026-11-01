@@ -1,4 +1,5 @@
 import os
+import io
 import random
 import asyncio
 import discord
@@ -20,6 +21,69 @@ TEAM_QUESTION_POOL = [
 ]
 
 
+# --- Helper: Locate Staff / Director Log Channel ---
+def get_director_log_channel(guild: discord.Guild):
+    """Finds the most suitable channel for archiving transcripts."""
+    # 1. Explicit ID check from config/env
+    log_id = int(os.getenv("TICKET_LOGS_CHANNEL_ID", getattr(config, "TICKET_LOGS_CHANNEL_ID", 0)))
+    if log_id:
+        chan = guild.get_channel(log_id)
+        if chan:
+            return chan
+
+    # 2. Look for designated logging names
+    for name in ["ticket-logs", "bot-errors", "bot-memory"]:
+        chan = discord.utils.get(guild.text_channels, name=name)
+        if chan:
+            return chan
+
+    # 3. Look within BACKUPS & CONTROL category
+    category = discord.utils.get(guild.categories, name="🛠️ BACKUPS & CONTROL")
+    if category and category.text_channels:
+        return category.text_channels[0]
+
+    return None
+
+
+# --- Helper: Generate Text Transcript ---
+async def generate_channel_transcript(channel: discord.TextChannel) -> tuple[io.BytesIO, int]:
+    """Scrapes message history chronologically and formats into a UTF-8 text file."""
+    messages = []
+    async for msg in channel.history(limit=1000, oldest_first=True):
+        time_str = msg.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+        author_str = f"{msg.author} ({msg.author.id})"
+        content = msg.content or "[No Text Content]"
+
+        attachments_str = ""
+        if msg.attachments:
+            att_urls = [a.url for a in msg.attachments]
+            attachments_str = f"\n  [Attachments: {' | '.join(att_urls)}]"
+
+        embeds_str = ""
+        if msg.embeds:
+            embed_summaries = []
+            for e in msg.embeds:
+                title = e.title or "Untitled"
+                embed_summaries.append(f"Embed: {title}")
+            embeds_str = f"\n  [{' | '.join(embed_summaries)}]"
+
+        messages.append(f"[{time_str}] {author_str}:\n  {content}{attachments_str}{embeds_str}\n")
+
+    transcript_text = (
+        f"=====================================================\n"
+        f"TRANSCRIPT FOR CHANNEL: #{channel.name}\n"
+        f"SERVER: {channel.guild.name} ({channel.guild.id})\n"
+        f"EXPORTED AT: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+        f"TOTAL ARCHIVED MESSAGES: {len(messages)}\n"
+        f"=====================================================\n\n"
+        + "\n".join(messages)
+    )
+
+    buffer = io.BytesIO(transcript_text.encode("utf-8"))
+    buffer.seek(0)
+    return buffer, len(messages)
+
+
 # --- Helper: Create Isolated, Locked Channel ---
 async def create_locked_channel(interaction: discord.Interaction, prefix: str, title: str, fields: list[tuple[str, str]], color: discord.Color):
     """Provisions a private channel visible ONLY to the user, Directors, and Admins."""
@@ -28,21 +92,18 @@ async def create_locked_channel(interaction: discord.Interaction, prefix: str, t
     timestamp = datetime.now(timezone.utc).strftime("%H%M")
     channel_name = f"{prefix}-{member.name[:10]}-{timestamp}"
 
-    # Strict isolation: @everyone locked out completely
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False, read_messages=False),
         member: discord.PermissionOverwrite(view_channel=True, read_messages=True, send_messages=True, attach_files=True),
         guild.me: discord.PermissionOverwrite(view_channel=True, read_messages=True, send_messages=True, manage_channels=True)
     }
 
-    # Authorize Director role if present in server
     director_role = discord.utils.get(guild.roles, name=config.DIRECTOR_ROLE_NAME)
     if director_role:
         overwrites[director_role] = discord.PermissionOverwrite(
             view_channel=True, read_messages=True, send_messages=True, manage_channels=True
         )
 
-    # Allow administrators and staff roles with manage_channels to view
     for role in guild.roles:
         if role.permissions.administrator or role.name.lower() in ["admin", "administrator", "head mod"]:
             overwrites[role] = discord.PermissionOverwrite(view_channel=True, read_messages=True, send_messages=True)
@@ -50,7 +111,7 @@ async def create_locked_channel(interaction: discord.Interaction, prefix: str, t
     channel = await guild.create_text_channel(
         name=channel_name,
         overwrites=overwrites,
-        topic=f"Private Desk // Operative: {member.name} ({member.id})"
+        topic=f"Private Desk // Creator: {member.name} ({member.id})"
     )
 
     embed = discord.Embed(
@@ -109,7 +170,6 @@ class GeneralSupportModal(discord.ui.Modal, title="🎫 General Support Request"
 class TeamApplicationModal(discord.ui.Modal, title="📝 Staff Team Application"):
     def __init__(self):
         super().__init__()
-        # Pick 3 questions randomly from the pool
         selected = random.sample(TEAM_QUESTION_POOL, 3)
 
         self.age_tz = discord.ui.TextInput(
@@ -227,7 +287,7 @@ class BotComplaintModal(discord.ui.Modal, title="⚠️ Bot Complaint / Bug Repo
         await interaction.followup.send(f"✅ Your complaint has been submitted privately: {channel.mention}", ephemeral=True)
 
 
-# --- Persistent Inside-Channel Controls (Claim / Close) ---
+# --- Persistent Inside-Channel Controls (Claim / Close with Transcript) ---
 class ActiveTicketControls(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -242,9 +302,43 @@ class ActiveTicketControls(discord.ui.View):
 
     @discord.ui.button(label="Close & Delete", style=discord.ButtonStyle.danger, emoji="🔒", custom_id="close_ticket_btn")
     async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("🔒 Deleting private channel in 5 seconds...")
+        await interaction.response.defer()
+        channel = interaction.channel
+
+        await channel.send("📑 Compiling full audit transcript and dispatching to Director records...")
+
+        # 1. Generate text transcript buffer
+        buffer, count = await generate_channel_transcript(channel)
+        filename = f"transcript-{channel.name}-{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.txt"
+        discord_file = discord.File(buffer, filename=filename)
+
+        # 2. Transmit to director logging channel
+        log_channel = get_director_log_channel(interaction.guild)
+        if log_channel:
+            log_embed = discord.Embed(
+                title="🗄️ Closed Ticket Archive",
+                description=f"A private session has been finalized and purged from the server.",
+                color=discord.Color.dark_grey(),
+                timestamp=datetime.now(timezone.utc)
+            )
+            log_embed.add_field(name="Channel Name", value=f"`#{channel.name}`", inline=True)
+            log_embed.add_field(name="Closed By", value=interaction.user.mention, inline=True)
+            log_embed.add_field(name="Archived Messages", value=f"`{count}` messages", inline=True)
+            log_embed.add_field(name="Channel Topic", value=channel.topic or "*None*", inline=False)
+            log_embed.set_footer(text="Project-Edith • Security Audit Vault")
+
+            try:
+                await log_channel.send(embed=log_embed, file=discord_file)
+            except Exception as e:
+                print(f"[TRANSCRIPT DISPATCH ERROR] {e}")
+
+        # 3. Final countdown & channel deletion
+        await channel.send("🔒 **Archive complete.** Deleting channel in 5 seconds...")
         await asyncio.sleep(5)
-        await interaction.channel.delete(reason="Channel Closed via Ticket Controls")
+        try:
+            await channel.delete(reason=f"Closed by {interaction.user} (Transcript archived)")
+        except Exception:
+            pass
 
 
 # --- Main Dashboard Panel View ---
@@ -298,7 +392,7 @@ class Tickets(commands.Cog):
 
         embed.add_field(
             name="🔒 Privacy & Security",
-            value="All channels are locked and restricted exclusively to **you**, the **Directorate**, and **Server Administrators**.",
+            value="All channels are locked and restricted exclusively to **you**, the **Directorate**, and **Server Administrators**.\nUpon closure, an encrypted transcript is archived to director records.",
             inline=False
         )
         embed.set_footer(text="Click a button below to launch a private channel")
@@ -308,7 +402,8 @@ class Tickets(commands.Cog):
     @commands.has_permissions(administrator=True)
     async def prefix_panel(self, ctx: commands.Context):
         """Deploy the complete Dispatch Hub: .ticket_panel"""
-        await ctx.channel.send(embed=self.create_panel_embed(), view=TicketPluginView())
+        embed = self.create_panel_embed()
+        await ctx.channel.send(embed=embed, view=TicketPluginView())
         try:
             await ctx.message.delete()
         except Exception:
@@ -317,7 +412,8 @@ class Tickets(commands.Cog):
     @app_commands.command(name="ticket_panel", description="Deploy the Server Dispatch & Assistance Hub panel.")
     @app_commands.checks.has_permissions(administrator=True)
     async def slash_panel(self, interaction: discord.Interaction):
-        await interaction.channel.send(embed=self.create_panel_embed(), view=TicketPluginView())
+        embed = self.create_panel_embed()
+        await interaction.channel.send(embed=embed, view=TicketPluginView())
         await interaction.response.send_message("Dispatch hub deployed.", ephemeral=True)
 
 async def setup(bot):
