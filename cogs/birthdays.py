@@ -36,6 +36,7 @@ def get_days_until(day: int, month: int) -> int:
         return (target_next_year - today).days
 
 
+# --- Personal Registration Modal ---
 class CleanBirthdayModal(discord.ui.Modal, title="Register Your Birthday"):
     day = discord.ui.TextInput(
         label="Day of Birth (1-31)",
@@ -88,6 +89,7 @@ class CleanBirthdayModal(discord.ui.Modal, title="Register Your Birthday"):
             await interaction.followup.send(f"⚠️ Failed to save birthday: `{e}`", ephemeral=True)
 
 
+# --- Master Override Modal ---
 class MasterSetModal(discord.ui.Modal):
     def __init__(self, cog, target_member: discord.Member):
         super().__init__(title=f"Set Birthday: {target_member.name[:16]}")
@@ -140,6 +142,7 @@ class MasterSetModal(discord.ui.Modal):
             await interaction.followup.send(f"⚠️ Failed to save birthday: `{e}`", ephemeral=True)
 
 
+# --- User Select Dropdown for Master Control ---
 class DirectorMemberSelect(discord.ui.UserSelect):
     def __init__(self, cog):
         super().__init__(
@@ -167,6 +170,7 @@ class MasterUserPickerView(discord.ui.View):
         self.add_item(DirectorMemberSelect(cog))
 
 
+# --- Main Clean Dashboard Buttons ---
 class CleanBirthdayView(discord.ui.View):
     def __init__(self, cog):
         super().__init__(timeout=None)
@@ -291,14 +295,16 @@ class CleanBirthdayView(discord.ui.View):
                 await interaction.response.send_message(f"⚠️ Error: `{e}`", ephemeral=True)
 
 
+# --- Birthday Cog Engine ---
 class Birthdays(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.check_birthdays.start()
+        self.active_view = CleanBirthdayView(self)
 
     async def cog_load(self):
-        """Self-registers persistent view when loaded, preventing circular imports in main.py."""
-        self.bot.add_view(CleanBirthdayView(self))
+        """Self-registers persistent view once, preventing circular imports in main.py and duplicate modals."""
+        self.bot.add_view(self.active_view)
 
     def cog_unload(self):
         self.check_birthdays.cancel()
@@ -400,17 +406,17 @@ class Birthdays(commands.Cog):
     @commands.has_permissions(administrator=True)
     async def prefix_panel(self, ctx: commands.Context):
         embed = await self.create_panel_embed()
-        await ctx.channel.send(embed=embed, view=CleanBirthdayView(self))
         try:
             await ctx.message.delete()
         except Exception:
             pass
+        await ctx.channel.send(embed=embed, view=self.active_view)
 
     @app_commands.command(name="birthday_panel", description="Deploy the clean Birthday Panel.")
     @app_commands.checks.has_permissions(administrator=True)
     async def slash_panel(self, interaction: discord.Interaction):
         embed = await self.create_panel_embed()
-        await interaction.channel.send(embed=embed, view=CleanBirthdayView(self))
+        await interaction.channel.send(embed=embed, view=self.active_view)
         await interaction.response.send_message("Birthday panel deployed.", ephemeral=True)
 
 async def setup(bot):
