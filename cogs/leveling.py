@@ -81,10 +81,8 @@ class XpDropClaimView(discord.ui.View):
         if is_server_booster(user):
             awarded_xp = math.ceil(self.xp_amount * BOOSTER_XP_MULTIPLIER)
 
-        # Award XP directly to claimer
         await self.cog.add_xp(user, self.xp_amount, reason="Random XP Drop Claim", channel=interaction.channel)
 
-        # Update drop message embed
         embed = discord.Embed(
             title="🎁 XP Drop Claimed!",
             description=(
@@ -186,7 +184,7 @@ class Leveling(commands.Cog):
         }
 
     async def add_xp(self, user: discord.Member, amount: int, reason: str = "Activity", channel: discord.TextChannel = None):
-        """Grants XP with automatic 1.5x Booster multiplier calculation."""
+        """Grants XP, calculates level progression, awards milestone roles, and announces to the Announcement Channel."""
         if user.bot or not isinstance(user, discord.Member):
             return
 
@@ -230,15 +228,27 @@ class Leveling(commands.Cog):
         if leveled_up:
             new_roles_awarded = await self._assign_milestone_roles(user, current_level)
 
-            target_chan = channel
-            if not target_chan and config.ANNOUNCEMENT_CHANNEL_ID:
-                target_chan = self.bot.get_channel(config.ANNOUNCEMENT_CHANNEL_ID)
+            # Prioritize the Announcement Channel for Level-Up Messages
+            target_chan = None
+            announcement_id = int(getattr(config, "ANNOUNCEMENT_CHANNEL_ID", 0))
+            if announcement_id and announcement_id != 0:
+                target_chan = self.bot.get_channel(announcement_id)
+                if not target_chan:
+                    try:
+                        target_chan = await self.bot.fetch_channel(announcement_id)
+                    except Exception:
+                        target_chan = None
+
+            # Fallback to local channel if no announcement channel is found
+            if not target_chan:
+                target_chan = channel
 
             if target_chan:
                 embed = discord.Embed(
                     title="🎉 LEVEL ADVANCEMENT!",
                     description=f"Congratulations {user.mention}! You advanced from **Level {old_level}** to **Level {current_level} / {MAX_LEVEL}**!",
-                    color=discord.Color.gold()
+                    color=discord.Color.gold(),
+                    timestamp=datetime.now(timezone.utc)
                 )
 
                 if is_server_booster(user):
@@ -264,11 +274,11 @@ class Leveling(commands.Cog):
                     )
 
                 embed.set_thumbnail(url=user.display_avatar.url)
-                embed.set_footer(text="Project-Edith • Level Progression")
+                embed.set_footer(text="Project-Edith • Server Leveling Hub")
                 try:
-                    await target_chan.send(embed=embed)
-                except Exception:
-                    pass
+                    await target_chan.send(content=f"📢 Attention {user.mention}!", embed=embed)
+                except Exception as e:
+                    print(f"[LEVEL UP DISPATCH ERROR] {e}")
 
     async def trigger_xp_drop(self, channel: discord.TextChannel, amount: int = None):
         """Spawns an interactive XP drop into the designated channel."""
@@ -328,7 +338,6 @@ class Leveling(commands.Cog):
 
         await self.add_xp(message.author, base_xp, reason="Message XP", channel=message.channel)
 
-        # Roll for Random XP Drop Chance
         if random.random() < DROP_CHANCE:
             asyncio.create_task(self.trigger_xp_drop(message.channel))
 
@@ -371,7 +380,6 @@ class Leveling(commands.Cog):
     # --- Rank Command ---
     @commands.command(name="rank")
     async def rank_cmd(self, ctx: commands.Context, member: discord.Member = None):
-        """Check your rank card with Booster status."""
         target = member or ctx.author
         data = await self.get_or_create_user(target.id, target.display_name)
 
@@ -464,7 +472,6 @@ class Leveling(commands.Cog):
     # --- Leaderboard Command ---
     @commands.command(name="leaderboard", aliases=["lb", "top"])
     async def leaderboard_cmd(self, ctx: commands.Context):
-        """View the top 10 members on the server."""
         async with self.bot.db.execute("""
             SELECT user_id, user_name, level, xp, messages_count
             FROM levels
@@ -525,11 +532,10 @@ class Leveling(commands.Cog):
         embed.set_footer(text="Project-Edith • Leveling Matrix")
         await interaction.response.send_message(embed=embed)
 
-    # --- Manual Drop Command (Admin / Director) ---
+    # --- Manual Drop Command ---
     @commands.command(name="dropxp")
     @commands.has_permissions(administrator=True)
     async def manual_drop_cmd(self, ctx: commands.Context, amount: int = None):
-        """Spawn a manual XP Drop: .dropxp or .dropxp 500"""
         if amount and not (10 <= amount <= 1000):
             await ctx.send("❌ XP Drop amount must be between 10 and 1,000 XP.")
             return
@@ -552,11 +558,10 @@ class Leveling(commands.Cog):
         await interaction.response.send_message("🎁 Spawning supply drop...", ephemeral=True)
         await self.trigger_xp_drop(interaction.channel, amount)
 
-    # --- Set Level Command ---
+    # --- Set Level Command (Testing) ---
     @commands.command(name="setlevel")
     @commands.has_permissions(administrator=True)
     async def set_level_cmd(self, ctx: commands.Context, member: discord.Member, target_level: int):
-        """Admin command to manually adjust member levels: .setlevel @user 10"""
         if not (1 <= target_level <= MAX_LEVEL):
             await ctx.send(f"❌ Level must be between 1 and {MAX_LEVEL}.")
             return
@@ -574,6 +579,25 @@ class Leveling(commands.Cog):
         if awarded:
             msg += f" Assigned roles: {', '.join(awarded)}"
         await ctx.send(msg)
+
+        # Trigger celebratory announcement directly into the announcement channel
+        announcement_id = int(getattr(config, "ANNOUNCEMENT_CHANNEL_ID", 0))
+        target_chan = self.bot.get_channel(announcement_id) if announcement_id else ctx.channel
+        if target_chan:
+            embed = discord.Embed(
+                title="🎉 LEVEL ADVANCEMENT!",
+                description=f"Congratulations {member.mention}! You advanced to **Level {target_level} / {MAX_LEVEL}**!",
+                color=discord.Color.gold(),
+                timestamp=datetime.now(timezone.utc)
+            )
+            if awarded:
+                embed.add_field(name="🎖️ Milestone Reward Unlocked!", value=", ".join([f"**{r}**" for r in awarded]), inline=False)
+            embed.set_thumbnail(url=member.display_avatar.url)
+            embed.set_footer(text="Project-Edith • Server Leveling Hub")
+            try:
+                await target_chan.send(content=f"📢 Attention {member.mention}!", embed=embed)
+            except Exception:
+                pass
 
 
 async def setup(bot):
