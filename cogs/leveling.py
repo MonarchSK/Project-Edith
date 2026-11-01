@@ -1,4 +1,5 @@
 import time
+import math
 import random
 import discord
 from discord import app_commands
@@ -11,6 +12,7 @@ MSG_COOLDOWN_SECONDS = 60
 MSG_XP_MIN = 15
 MSG_XP_MAX = 25
 VOICE_XP_PER_MINUTE = 10
+BOOSTER_XP_MULTIPLIER = 1.5  # 1.5x XP Boost for Server Boosters
 
 # Milestone rewards mapping: level -> (role_name, role_color_hex)
 MILESTONE_ROLES = {
@@ -40,6 +42,13 @@ def get_progress_bar(current: int, target: int, length: int = 10) -> str:
     return f"{'▰' * filled}{'▱' * empty} {int(ratio * 100)}%"
 
 
+def is_server_booster(member: discord.Member) -> bool:
+    """Checks if the user has boosted the server using Discord's premium_since attribute."""
+    if not isinstance(member, discord.Member):
+        return False
+    return member.premium_since is not None
+
+
 class Leveling(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -57,7 +66,6 @@ class Leveling(commands.Cog):
 
         for milestone_lvl, (role_name, role_color) in sorted(MILESTONE_ROLES.items()):
             if current_level >= milestone_lvl:
-                # Find role or create if not present
                 role = discord.utils.get(guild.roles, name=role_name)
                 if not role:
                     try:
@@ -70,7 +78,6 @@ class Leveling(commands.Cog):
                         print(f"[ROLE ERROR] Missing permissions to create role '{role_name}'.")
                         continue
 
-                # Assign role if member does not have it yet
                 if role not in member.roles:
                     try:
                         await member.add_roles(role, reason=f"Level {milestone_lvl} milestone reached")
@@ -113,15 +120,20 @@ class Leveling(commands.Cog):
         }
 
     async def add_xp(self, user: discord.Member, amount: int, reason: str = "Activity", channel: discord.TextChannel = None):
-        """Grants XP to member, calculates level progression, awards milestone roles, and announces level-ups."""
+        """Grants XP with automatic 1.5x Booster multiplier calculation."""
         if user.bot or not isinstance(user, discord.Member):
             return
 
+        # Apply 1.5x Multiplier for Boosters
+        final_xp = amount
+        if is_server_booster(user):
+            final_xp = math.ceil(amount * BOOSTER_XP_MULTIPLIER)
+
         data = await self.get_or_create_user(user.id, user.display_name)
         if data["level"] >= MAX_LEVEL:
-            return  # Member reached Level 50 cap
+            return
 
-        new_xp = data["xp"] + amount
+        new_xp = data["xp"] + final_xp
         current_level = data["level"]
         old_level = current_level
         leveled_up = False
@@ -146,12 +158,10 @@ class Leveling(commands.Cog):
         """, (new_xp, current_level, user.display_name, user.id))
         await self.bot.db.commit()
 
-        # Mark backup engine as modified for queued snapshotting
         backup_cog = self.bot.get_cog("DiscordMemoryBackup")
         if backup_cog and hasattr(backup_cog, "mark_dirty"):
             backup_cog.mark_dirty()
 
-        # Handle level up and milestone role awards
         if leveled_up:
             new_roles_awarded = await self._assign_milestone_roles(user, current_level)
 
@@ -165,6 +175,13 @@ class Leveling(commands.Cog):
                     description=f"Congratulations {user.mention}! You advanced from **Level {old_level}** to **Level {current_level} / {MAX_LEVEL}**!",
                     color=discord.Color.gold()
                 )
+
+                if is_server_booster(user):
+                    embed.add_field(
+                        name="🚀 Booster Perk Active",
+                        value="`1.5x XP Multiplier` applied to all activities!",
+                        inline=False
+                    )
 
                 if new_roles_awarded:
                     roles_formatted = ", ".join([f"**{r}**" for r in new_roles_awarded])
@@ -194,7 +211,6 @@ class Leveling(commands.Cog):
         if message.author.bot or not message.guild:
             return
 
-        # Ignore bot prefix commands
         if message.content.startswith("."):
             return
 
@@ -204,7 +220,7 @@ class Leveling(commands.Cog):
             return
 
         self.msg_cooldowns[message.author.id] = now
-        xp_gain = random.randint(MSG_XP_MIN, MSG_XP_MAX)
+        base_xp = random.randint(MSG_XP_MIN, MSG_XP_MAX)
 
         await self.bot.db.execute("""
             INSERT INTO levels (user_id, user_name, xp, level, messages_count, voice_minutes)
@@ -213,7 +229,7 @@ class Leveling(commands.Cog):
         """, (message.author.id, message.author.display_name))
         await self.bot.db.commit()
 
-        await self.add_xp(message.author, xp_gain, reason="Message XP", channel=message.channel)
+        await self.add_xp(message.author, base_xp, reason="Message XP", channel=message.channel)
 
     # --- Voice State Listener & XP Tracker ---
     @commands.Cog.listener()
@@ -228,10 +244,9 @@ class Leveling(commands.Cog):
 
     @tasks.loop(minutes=1)
     async def voice_xp_loop(self):
-        """Iterates over voice channels, awarding XP to eligible members."""
+        """Iterates over voice channels, awarding XP with Booster bonuses."""
         for guild in self.bot.guilds:
             for vc in guild.voice_channels:
-                # Disqualify if user is alone or in AFK channel
                 if len(vc.members) < 2 or vc == guild.afk_channel:
                     continue
 
@@ -255,7 +270,7 @@ class Leveling(commands.Cog):
     # --- Rank Command ---
     @commands.command(name="rank")
     async def rank_cmd(self, ctx: commands.Context, member: discord.Member = None):
-        """Check your rank or another member's level card."""
+        """Check your rank card with Booster status."""
         target = member or ctx.author
         data = await self.get_or_create_user(target.id, target.display_name)
 
@@ -273,20 +288,22 @@ class Leveling(commands.Cog):
                 rank_pos = idx + 1
                 break
 
+        booster_badge = "🚀 **Active (1.5x XP)**" if is_server_booster(target) else "None (`1.0x`)"
+
         embed = discord.Embed(
             title=f"📊 Rank Card — {target.display_name}",
-            color=discord.Color.blue(),
+            color=discord.Color.magenta() if is_server_booster(target) else discord.Color.blue(),
             timestamp=datetime.now(timezone.utc)
         )
         embed.set_thumbnail(url=target.display_avatar.url)
         embed.add_field(name="🏆 Server Rank", value=f"`#{rank_pos}` of `{len(all_users)}`", inline=True)
         embed.add_field(name="⭐ Level", value=f"`{data['level']} / {MAX_LEVEL}`", inline=True)
+        embed.add_field(name="🚀 Booster Multiplier", value=booster_badge, inline=True)
         embed.add_field(name="✨ Current XP", value=f"`{data['xp']} / {needed} XP`", inline=True)
-        embed.add_field(name="📈 Progress to Level Up", value=f"`{bar}`", inline=False)
         embed.add_field(name="💬 Messages", value=f"`{data['messages_count']}`", inline=True)
         embed.add_field(name="🎙️ Voice Time", value=f"`{data['voice_minutes']} mins`", inline=True)
+        embed.add_field(name="📈 Progress to Level Up", value=f"`{bar}`", inline=False)
 
-        # Show next milestone role preview
         upcoming_milestones = [lvl for lvl in sorted(MILESTONE_ROLES.keys()) if lvl > data["level"]]
         if upcoming_milestones:
             next_lvl = upcoming_milestones[0]
@@ -316,18 +333,21 @@ class Leveling(commands.Cog):
                 rank_pos = idx + 1
                 break
 
+        booster_badge = "🚀 **Active (1.5x XP)**" if is_server_booster(target) else "None (`1.0x`)"
+
         embed = discord.Embed(
             title=f"📊 Rank Card — {target.display_name}",
-            color=discord.Color.blue(),
+            color=discord.Color.magenta() if is_server_booster(target) else discord.Color.blue(),
             timestamp=datetime.now(timezone.utc)
         )
         embed.set_thumbnail(url=target.display_avatar.url)
         embed.add_field(name="🏆 Server Rank", value=f"`#{rank_pos}` of `{len(all_users)}`", inline=True)
         embed.add_field(name="⭐ Level", value=f"`{data['level']} / {MAX_LEVEL}`", inline=True)
+        embed.add_field(name="🚀 Booster Multiplier", value=booster_badge, inline=True)
         embed.add_field(name="✨ Current XP", value=f"`{data['xp']} / {needed} XP`", inline=True)
-        embed.add_field(name="📈 Progress to Level Up", value=f"`{bar}`", inline=False)
         embed.add_field(name="💬 Messages", value=f"`{data['messages_count']}`", inline=True)
         embed.add_field(name="🎙️ Voice Time", value=f"`{data['voice_minutes']} mins`", inline=True)
+        embed.add_field(name="📈 Progress to Level Up", value=f"`{bar}`", inline=False)
 
         upcoming_milestones = [lvl for lvl in sorted(MILESTONE_ROLES.keys()) if lvl > data["level"]]
         if upcoming_milestones:
@@ -404,7 +424,7 @@ class Leveling(commands.Cog):
         embed.set_footer(text="Project-Edith • Leveling Matrix")
         await interaction.response.send_message(embed=embed)
 
-    # --- Director Master Command to Manually Set Levels (For Testing) ---
+    # --- Director Master Command to Manually Set Levels ---
     @commands.command(name="setlevel")
     @commands.has_permissions(administrator=True)
     async def set_level_cmd(self, ctx: commands.Context, member: discord.Member, target_level: int):
@@ -421,7 +441,6 @@ class Leveling(commands.Cog):
         """, (target_level, member.id))
         await self.bot.db.commit()
 
-        # Sync milestone roles immediately
         awarded = await self._assign_milestone_roles(member, target_level)
         msg = f"✅ Set {member.mention}'s rank to **Level {target_level}**."
         if awarded:
