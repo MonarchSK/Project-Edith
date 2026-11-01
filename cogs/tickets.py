@@ -457,9 +457,14 @@ class Tickets(commands.Cog):
     @app_commands.command(name="ticket_panel", description="Deploy the Server Dispatch & Assistance Hub panel.")
     @app_commands.checks.has_permissions(administrator=True)
     async def slash_panel(self, interaction: discord.Interaction):
+        # 1. Immediately defer to beat Discord's 3-second deadline
+        await interaction.response.defer(ephemeral=True)
+
         embed = self.create_panel_embed()
+        # 2. Post panel to the current channel
         await interaction.channel.send(embed=embed, view=self.active_view)
-        await interaction.response.send_message("Dispatch hub deployed.", ephemeral=True)
+        # 3. Followup sends the ephemeral confirmation safely without timing out
+        await interaction.followup.send("Dispatch hub deployed successfully.", ephemeral=True)
 
 async def setup(bot):
     await bot.add_cog(Tickets(bot))
