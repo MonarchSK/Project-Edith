@@ -17,12 +17,11 @@ VOICE_XP_PER_MINUTE = 10
 BOOSTER_XP_MULTIPLIER = 1.5  # 1.5x XP Boost for Server Boosters
 
 # Random XP Drop Settings
-DROP_CHANCE = 0.03            # 3% chance per eligible chat message
+DROP_CHANCE = 0.03
 DROP_XP_MIN = 10
 DROP_XP_MAX = 1000
-DROP_TIMEOUT_SECONDS = 90     # Despawns after 90 seconds if unclaimed
+DROP_TIMEOUT_SECONDS = 90
 
-# Milestone rewards mapping: level -> (role_name, role_color_hex)
 MILESTONE_ROLES = {
     5: ("Bronze Operative", 0xCD7F32),
     10: ("Silver Operative", 0xC0C0C0),
@@ -32,7 +31,6 @@ MILESTONE_ROLES = {
 
 
 def calculate_xp_for_level(level: int) -> int:
-    """Standard progressive XP curve capped at level 50."""
     if level <= 0:
         return 0
     if level >= MAX_LEVEL:
@@ -41,7 +39,6 @@ def calculate_xp_for_level(level: int) -> int:
 
 
 def get_progress_bar(current: int, target: int, length: int = 10) -> str:
-    """Generates a text progress bar."""
     if target <= 0:
         return "▰" * length
     ratio = min(max(current / target, 0.0), 1.0)
@@ -51,7 +48,6 @@ def get_progress_bar(current: int, target: int, length: int = 10) -> str:
 
 
 def is_server_booster(member: discord.Member) -> bool:
-    """Checks if the user has boosted the server using Discord's premium_since attribute."""
     if not isinstance(member, discord.Member):
         return False
     return member.premium_since is not None
@@ -117,15 +113,16 @@ class XpDropClaimView(discord.ui.View):
 class Leveling(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.msg_cooldowns = {}   # {user_id: timestamp}
-        self.voice_tracking = {}  # {user_id: join_timestamp}
+        self.msg_cooldowns = {}
+        self.voice_tracking = {}
         self.voice_xp_loop.start()
+        self.weekly_report_loop.start()
 
     def cog_unload(self):
         self.voice_xp_loop.cancel()
+        self.weekly_report_loop.cancel()
 
     async def _play_voice_chime(self, member: discord.Member):
-        """Connects to the member's voice channel, plays a chime, and disconnects."""
         if not member.voice or not member.voice.channel:
             return
 
@@ -147,7 +144,6 @@ class Leveling(commands.Cog):
                 source = discord.FFmpegPCMAudio(sound_path)
                 voice_client.play(source)
 
-                # Wait for track duration up to 8 seconds, then leave
                 timeout_counter = 0
                 while voice_client.is_playing() and timeout_counter < 16:
                     await asyncio.sleep(0.5)
@@ -164,7 +160,6 @@ class Leveling(commands.Cog):
                     pass
 
     async def _assign_milestone_roles(self, member: discord.Member, current_level: int) -> list[str]:
-        """Ensures all milestone roles up to the current level are assigned to the member."""
         awarded_role_names = []
         guild = member.guild
 
@@ -224,7 +219,6 @@ class Leveling(commands.Cog):
         }
 
     async def add_xp(self, user: discord.Member, amount: int, reason: str = "Activity", channel: discord.TextChannel = None):
-        """Grants XP, announces to Announcement channel with role ping, and plays voice chime if connected."""
         if user.bot or not isinstance(user, discord.Member):
             return
 
@@ -268,7 +262,6 @@ class Leveling(commands.Cog):
         if leveled_up:
             new_roles_awarded = await self._assign_milestone_roles(user, current_level)
 
-            # Prioritize the Announcement Channel
             target_chan = None
             announcement_id = int(getattr(config, "ANNOUNCEMENT_CHANNEL_ID", 0))
             if announcement_id and announcement_id != 0:
@@ -315,7 +308,6 @@ class Leveling(commands.Cog):
                 embed.set_thumbnail(url=user.display_avatar.url)
                 embed.set_footer(text="Project-Edith • Server Leveling Hub")
 
-                # Build ping content: Mention user + optional custom alert role
                 ping_content = f"📢 Attention {user.mention}!"
                 alert_role_name = getattr(config, "LEVEL_UP_PING_ROLE_NAME", None)
                 if alert_role_name:
@@ -332,11 +324,9 @@ class Leveling(commands.Cog):
                 except Exception as e:
                     print(f"[LEVEL UP DISPATCH ERROR] {e}")
 
-            # Trigger optional voice sound effect if user is in voice
             asyncio.create_task(self._play_voice_chime(user))
 
     async def trigger_xp_drop(self, channel: discord.TextChannel, amount: int = None):
-        """Spawns an interactive XP drop into the designated channel."""
         drop_val = amount or random.randint(DROP_XP_MIN, DROP_XP_MAX)
 
         if drop_val >= 600:
@@ -367,7 +357,107 @@ class Leveling(commands.Cog):
         msg = await channel.send(embed=embed, view=view)
         view.message = msg
 
-    # --- Text Message XP Listener with Random Drop Trigger ---
+    # --- Weekly Report Builder ---
+    async def generate_weekly_report_embed(self, guild: discord.Guild) -> discord.Embed:
+        """Compiles weekly community ranking and statistics."""
+        async with self.bot.db.execute("""
+            SELECT user_id, user_name, level, xp, messages_count, voice_minutes
+            FROM levels
+            ORDER BY level DESC, xp DESC
+        """) as cursor:
+            all_records = await cursor.fetchall()
+
+        total_members = len(all_records)
+        total_messages = sum(r[4] for r in all_records)
+        total_voice_mins = sum(r[5] for r in all_records)
+
+        top_typer = max(all_records, key=lambda r: r[4]) if all_records else None
+        top_voice = max(all_records, key=lambda r: r[5]) if all_records else None
+
+        embed = discord.Embed(
+            title="📈 Project-Edith // Weekly Community Level Report",
+            description=(
+                f"Performance digest and activity ranking for **{guild.name}** over the past 7 days.\n"
+                f"Tracked Operatives: `{total_members}` | Total Messages: `{total_messages}` | Total Voice: `{total_voice_mins} mins`\n"
+            ),
+            color=discord.Color.from_rgb(46, 204, 113),
+            timestamp=datetime.now(timezone.utc)
+        )
+        if guild.icon:
+            embed.set_thumbnail(url=guild.icon.url)
+
+        # Star Operatives
+        if top_typer and top_typer[4] > 0:
+            embed.add_field(
+                name="💬 Chat Champion",
+                value=f"<@{top_typer[0]}> (`{top_typer[4]}` msgs)",
+                inline=True
+            )
+        if top_voice and top_voice[5] > 0:
+            embed.add_field(
+                name="🎙️ Voice Titan",
+                value=f"<@{top_voice[0]}> (`{top_voice[5]}` mins)",
+                inline=True
+            )
+
+        # Top 5 Overall Leaderboard
+        lines = []
+        medals = ["🥇", "🥈", "🥉", "🎖️", "🎖️"]
+        for idx, (uid, name, lvl, xp, msgs, voice) in enumerate(all_records[:5]):
+            medal = medals[idx]
+            lines.append(f"{medal} **{name or 'Operative'}** (<@{uid}>)\n   ↳ Level **{lvl} / {MAX_LEVEL}** • `{xp} XP` • `{msgs} msgs` • `{voice}m VC`")
+
+        if lines:
+            embed.add_field(name="🏆 Top 5 Operative Roster", value="\n\n".join(lines), inline=False)
+        else:
+            embed.add_field(name="🏆 Top 5 Operative Roster", value="*No activity logged this week.*", inline=False)
+
+        embed.add_field(
+            name="🚀 Earn XP This Week",
+            value="Participate in discussions, join voice lounges, run `.bump` every 2 hours, and catch random XP drops!",
+            inline=False
+        )
+        embed.set_footer(text="Project-Edith • Weekly Automated Digest")
+        return embed
+
+    # --- Automated Sunday Midnight Loop ---
+    @tasks.loop(hours=1)
+    async def weekly_report_loop(self):
+        now = datetime.now(timezone.utc)
+        # Trigger on Sunday (weekday 6) at 00:00 UTC
+        if now.weekday() == 6 and now.hour == 0:
+            announcement_id = int(getattr(config, "ANNOUNCEMENT_CHANNEL_ID", 0))
+            if not announcement_id:
+                return
+
+            for guild in self.bot.guilds:
+                channel = guild.get_channel(announcement_id)
+                if channel:
+                    embed = await self.generate_weekly_report_embed(guild)
+                    try:
+                        await channel.send(content="📊 **The Weekly Server Activity & Level Report is live!**", embed=embed)
+                    except Exception as e:
+                        print(f"[WEEKLY REPORT ERROR] Could not send report: {e}")
+
+    @weekly_report_loop.before_loop
+    async def before_weekly_report(self):
+        await self.bot.wait_until_ready()
+
+    # --- Commands ---
+    @commands.command(name="weeklyreport", aliases=["levelreport", "weekly_report"])
+    @commands.has_permissions(administrator=True)
+    async def prefix_weekly_report(self, ctx: commands.Context):
+        """Generate and post the Weekly Level Report on demand."""
+        embed = await self.generate_weekly_report_embed(ctx.guild)
+        await ctx.send(embed=embed)
+
+    @app_commands.command(name="weekly_report", description="Generate and display the Weekly Server Level & Activity Report.")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def slash_weekly_report(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        embed = await self.generate_weekly_report_embed(interaction.guild)
+        await interaction.followup.send(embed=embed)
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot or not message.guild:
@@ -396,7 +486,6 @@ class Leveling(commands.Cog):
         if random.random() < DROP_CHANCE:
             asyncio.create_task(self.trigger_xp_drop(message.channel))
 
-    # --- Voice State Listener & XP Tracker ---
     @commands.Cog.listener()
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
         if member.bot:
@@ -409,7 +498,6 @@ class Leveling(commands.Cog):
 
     @tasks.loop(minutes=1)
     async def voice_xp_loop(self):
-        """Iterates over voice channels, awarding XP with Booster bonuses."""
         for guild in self.bot.guilds:
             for vc in guild.voice_channels:
                 if len(vc.members) < 2 or vc == guild.afk_channel:
@@ -432,7 +520,6 @@ class Leveling(commands.Cog):
     async def before_voice_loop(self):
         await self.bot.wait_until_ready()
 
-    # --- Rank Command ---
     @commands.command(name="rank")
     async def rank_cmd(self, ctx: commands.Context, member: discord.Member = None):
         target = member or ctx.author
@@ -524,7 +611,6 @@ class Leveling(commands.Cog):
         embed.set_footer(text="Project-Edith • Level Progression")
         await interaction.response.send_message(embed=embed)
 
-    # --- Leaderboard Command ---
     @commands.command(name="leaderboard", aliases=["lb", "top"])
     async def leaderboard_cmd(self, ctx: commands.Context):
         async with self.bot.db.execute("""
@@ -587,7 +673,6 @@ class Leveling(commands.Cog):
         embed.set_footer(text="Project-Edith • Leveling Matrix")
         await interaction.response.send_message(embed=embed)
 
-    # --- Manual Drop Command ---
     @commands.command(name="dropxp")
     @commands.has_permissions(administrator=True)
     async def manual_drop_cmd(self, ctx: commands.Context, amount: int = None):
@@ -613,7 +698,6 @@ class Leveling(commands.Cog):
         await interaction.response.send_message("🎁 Spawning supply drop...", ephemeral=True)
         await self.trigger_xp_drop(interaction.channel, amount)
 
-    # --- Set Level Command (Testing) ---
     @commands.command(name="setlevel")
     @commands.has_permissions(administrator=True)
     async def set_level_cmd(self, ctx: commands.Context, member: discord.Member, target_level: int):
@@ -635,7 +719,6 @@ class Leveling(commands.Cog):
             msg += f" Assigned roles: {', '.join(awarded)}"
         await ctx.send(msg)
 
-        # Trigger celebratory announcement directly into the announcement channel
         announcement_id = int(getattr(config, "ANNOUNCEMENT_CHANNEL_ID", 0))
         target_chan = self.bot.get_channel(announcement_id) if announcement_id else ctx.channel
         if target_chan:
@@ -666,7 +749,6 @@ class Leveling(commands.Cog):
             except Exception as e:
                 print(f"[LEVEL UP DISPATCH ERROR] {e}")
 
-        # Voice chime check
         asyncio.create_task(self._play_voice_chime(member))
 
 
