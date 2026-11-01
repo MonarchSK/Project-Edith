@@ -1,3 +1,4 @@
+import os
 import time
 import math
 import random
@@ -123,6 +124,45 @@ class Leveling(commands.Cog):
     def cog_unload(self):
         self.voice_xp_loop.cancel()
 
+    async def _play_voice_chime(self, member: discord.Member):
+        """Connects to the member's voice channel, plays a chime, and disconnects."""
+        if not member.voice or not member.voice.channel:
+            return
+
+        sound_path = getattr(config, "LEVEL_UP_SOUND_FILE", "assets/levelup.mp3")
+        if not os.path.exists(sound_path):
+            return
+
+        vc_channel = member.voice.channel
+        guild = member.guild
+        voice_client = guild.voice_client
+
+        try:
+            if voice_client is None:
+                voice_client = await vc_channel.connect(timeout=10.0, reconnect=False)
+            elif voice_client.channel != vc_channel:
+                await voice_client.move_to(vc_channel)
+
+            if not voice_client.is_playing():
+                source = discord.FFmpegPCMAudio(sound_path)
+                voice_client.play(source)
+
+                # Wait for track duration up to 8 seconds, then leave
+                timeout_counter = 0
+                while voice_client.is_playing() and timeout_counter < 16:
+                    await asyncio.sleep(0.5)
+                    timeout_counter += 1
+
+                await voice_client.disconnect(force=True)
+
+        except Exception as e:
+            print(f"[VOICE CHIME NOTICE] Could not play level up audio: {e}")
+            if voice_client and voice_client.is_connected():
+                try:
+                    await voice_client.disconnect(force=True)
+                except Exception:
+                    pass
+
     async def _assign_milestone_roles(self, member: discord.Member, current_level: int) -> list[str]:
         """Ensures all milestone roles up to the current level are assigned to the member."""
         awarded_role_names = []
@@ -184,7 +224,7 @@ class Leveling(commands.Cog):
         }
 
     async def add_xp(self, user: discord.Member, amount: int, reason: str = "Activity", channel: discord.TextChannel = None):
-        """Grants XP, calculates level progression, awards milestone roles, and announces to the Announcement Channel."""
+        """Grants XP, announces to Announcement channel with role ping, and plays voice chime if connected."""
         if user.bot or not isinstance(user, discord.Member):
             return
 
@@ -228,7 +268,7 @@ class Leveling(commands.Cog):
         if leveled_up:
             new_roles_awarded = await self._assign_milestone_roles(user, current_level)
 
-            # Prioritize the Announcement Channel for Level-Up Messages
+            # Prioritize the Announcement Channel
             target_chan = None
             announcement_id = int(getattr(config, "ANNOUNCEMENT_CHANNEL_ID", 0))
             if announcement_id and announcement_id != 0:
@@ -239,7 +279,6 @@ class Leveling(commands.Cog):
                     except Exception:
                         target_chan = None
 
-            # Fallback to local channel if no announcement channel is found
             if not target_chan:
                 target_chan = channel
 
@@ -275,10 +314,26 @@ class Leveling(commands.Cog):
 
                 embed.set_thumbnail(url=user.display_avatar.url)
                 embed.set_footer(text="Project-Edith • Server Leveling Hub")
+
+                # Build ping content: Mention user + optional custom alert role
+                ping_content = f"📢 Attention {user.mention}!"
+                alert_role_name = getattr(config, "LEVEL_UP_PING_ROLE_NAME", None)
+                if alert_role_name:
+                    alert_role = discord.utils.get(user.guild.roles, name=alert_role_name)
+                    if alert_role:
+                        ping_content += f" | {alert_role.mention}"
+
                 try:
-                    await target_chan.send(content=f"📢 Attention {user.mention}!", embed=embed)
+                    await target_chan.send(
+                        content=ping_content,
+                        embed=embed,
+                        allowed_mentions=discord.AllowedMentions(roles=True, users=True)
+                    )
                 except Exception as e:
                     print(f"[LEVEL UP DISPATCH ERROR] {e}")
+
+            # Trigger optional voice sound effect if user is in voice
+            asyncio.create_task(self._play_voice_chime(user))
 
     async def trigger_xp_drop(self, channel: discord.TextChannel, amount: int = None):
         """Spawns an interactive XP drop into the designated channel."""
@@ -594,10 +649,25 @@ class Leveling(commands.Cog):
                 embed.add_field(name="🎖️ Milestone Reward Unlocked!", value=", ".join([f"**{r}**" for r in awarded]), inline=False)
             embed.set_thumbnail(url=member.display_avatar.url)
             embed.set_footer(text="Project-Edith • Server Leveling Hub")
+
+            ping_content = f"📢 Attention {member.mention}!"
+            alert_role_name = getattr(config, "LEVEL_UP_PING_ROLE_NAME", None)
+            if alert_role_name:
+                alert_role = discord.utils.get(member.guild.roles, name=alert_role_name)
+                if alert_role:
+                    ping_content += f" | {alert_role.mention}"
+
             try:
-                await target_chan.send(content=f"📢 Attention {member.mention}!", embed=embed)
-            except Exception:
-                pass
+                await target_chan.send(
+                    content=ping_content,
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions(roles=True, users=True)
+                )
+            except Exception as e:
+                print(f"[LEVEL UP DISPATCH ERROR] {e}")
+
+        # Voice chime check
+        asyncio.create_task(self._play_voice_chime(member))
 
 
 async def setup(bot):
