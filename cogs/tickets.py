@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import random
 import asyncio
 import discord
@@ -24,20 +25,17 @@ TEAM_QUESTION_POOL = [
 # --- Helper: Locate Staff / Director Log Channel ---
 def get_director_log_channel(guild: discord.Guild):
     """Finds the most suitable channel for archiving transcripts."""
-    # 1. Explicit ID check from config/env
     log_id = int(os.getenv("TICKET_LOGS_CHANNEL_ID", getattr(config, "TICKET_LOGS_CHANNEL_ID", 0)))
     if log_id:
         chan = guild.get_channel(log_id)
         if chan:
             return chan
 
-    # 2. Look for designated logging names
     for name in ["ticket-logs", "bot-errors", "bot-memory"]:
         chan = discord.utils.get(guild.text_channels, name=name)
         if chan:
             return chan
 
-    # 3. Look within BACKUPS & CONTROL category
     category = discord.utils.get(guild.categories, name="🛠️ BACKUPS & CONTROL")
     if category and category.text_channels:
         return category.text_channels[0]
@@ -82,6 +80,15 @@ async def generate_channel_transcript(channel: discord.TextChannel) -> tuple[io.
     buffer = io.BytesIO(transcript_text.encode("utf-8"))
     buffer.seek(0)
     return buffer, len(messages)
+
+
+# --- Helper: Extract Creator ID from Topic ---
+def extract_creator_id(topic: str) -> int | None:
+    """Extracts numeric user ID from topic string format: Creator: User (123456789)"""
+    if not topic:
+        return None
+    match = re.search(r"\((\d{15,21})\)", topic)
+    return int(match.group(1)) if match else None
 
 
 # --- Helper: Create Isolated, Locked Channel ---
@@ -134,7 +141,7 @@ async def create_locked_channel(interaction: discord.Interaction, prefix: str, t
     return channel
 
 
-# --- 1. General Support Modal ---
+# --- Modals ---
 class GeneralSupportModal(discord.ui.Modal, title="🎫 General Support Request"):
     subject = discord.ui.TextInput(
         label="Inquiry / Subject",
@@ -166,7 +173,6 @@ class GeneralSupportModal(discord.ui.Modal, title="🎫 General Support Request"
         await interaction.followup.send(f"✅ Your private support channel has been created: {channel.mention}", ephemeral=True)
 
 
-# --- 2. Team Application Modal with Random Questions ---
 class TeamApplicationModal(discord.ui.Modal, title="📝 Staff Team Application"):
     def __init__(self):
         super().__init__()
@@ -223,7 +229,6 @@ class TeamApplicationModal(discord.ui.Modal, title="📝 Staff Team Application"
         await interaction.followup.send(f"✅ Your staff application has been dispatched: {channel.mention}", ephemeral=True)
 
 
-# --- 3. Suggestion Modal ---
 class SuggestionModal(discord.ui.Modal, title="💡 Community Suggestion"):
     title_input = discord.ui.TextInput(
         label="Suggestion Title",
@@ -255,7 +260,6 @@ class SuggestionModal(discord.ui.Modal, title="💡 Community Suggestion"):
         await interaction.followup.send(f"✅ Your suggestion room has been initialized: {channel.mention}", ephemeral=True)
 
 
-# --- 4. Bot Complaints / Issue Modal ---
 class BotComplaintModal(discord.ui.Modal, title="⚠️ Bot Complaint / Bug Report"):
     issue_type = discord.ui.TextInput(
         label="Issue Type / Command",
@@ -287,7 +291,7 @@ class BotComplaintModal(discord.ui.Modal, title="⚠️ Bot Complaint / Bug Repo
         await interaction.followup.send(f"✅ Your complaint has been submitted privately: {channel.mention}", ephemeral=True)
 
 
-# --- Persistent Inside-Channel Controls (Claim / Close with Transcript) ---
+# --- Persistent Inside-Channel Controls (Claim / Close with Transcripts) ---
 class ActiveTicketControls(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -305,38 +309,80 @@ class ActiveTicketControls(discord.ui.View):
         await interaction.response.defer()
         channel = interaction.channel
 
-        await channel.send("📑 Compiling full audit transcript and dispatching to Director records...")
+        await channel.send("📑 Compiling full audit transcript and dispatching records...")
 
         # 1. Generate text transcript buffer
         buffer, count = await generate_channel_transcript(channel)
+        raw_bytes = buffer.getvalue()
         filename = f"transcript-{channel.name}-{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.txt"
-        discord_file = discord.File(buffer, filename=filename)
 
-        # 2. Transmit to director logging channel
+        # 2. Dispatch transcript copy to User's Direct Messages
+        dm_delivered = False
+        creator_id = extract_creator_id(channel.topic)
+        if creator_id:
+            target_user = interaction.guild.get_member(creator_id)
+            if not target_user:
+                try:
+                    target_user = await interaction.client.fetch_user(creator_id)
+                except Exception:
+                    target_user = None
+
+            if target_user:
+                user_file = discord.File(io.BytesIO(raw_bytes), filename=filename)
+                user_embed = discord.Embed(
+                    title="📑 Your Ticket Has Been Closed",
+                    description=(
+                        f"Hello **{target_user.name}**, your session in **#{channel.name}** "
+                        f"on **{interaction.guild.name}** has been marked as closed.\n\n"
+                        f"A full transcript of your conversation is attached below for your records."
+                    ),
+                    color=discord.Color.from_rgb(88, 101, 242),
+                    timestamp=datetime.now(timezone.utc)
+                )
+                user_embed.add_field(name="Closed By", value=interaction.user.name, inline=True)
+                user_embed.add_field(name="Archived Messages", value=f"`{count}` messages", inline=True)
+                user_embed.set_footer(text=f"{interaction.guild.name} • Support Records")
+
+                try:
+                    await target_user.send(embed=user_embed, file=user_file)
+                    dm_delivered = True
+                except discord.Forbidden:
+                    dm_delivered = False
+                except Exception as e:
+                    print(f"[USER DM TRANSCRIPT ERROR] {e}")
+                    dm_delivered = False
+
+        # 3. Transmit transcript copy to Director Logging Channel
         log_channel = get_director_log_channel(interaction.guild)
         if log_channel:
+            staff_file = discord.File(io.BytesIO(raw_bytes), filename=filename)
             log_embed = discord.Embed(
                 title="🗄️ Closed Ticket Archive",
-                description=f"A private session has been finalized and purged from the server.",
+                description="A private session has been finalized and purged from the server.",
                 color=discord.Color.dark_grey(),
                 timestamp=datetime.now(timezone.utc)
             )
             log_embed.add_field(name="Channel Name", value=f"`#{channel.name}`", inline=True)
             log_embed.add_field(name="Closed By", value=interaction.user.mention, inline=True)
             log_embed.add_field(name="Archived Messages", value=f"`{count}` messages", inline=True)
+            log_embed.add_field(
+                name="Creator DM Status",
+                value="✅ Successfully Delivered" if dm_delivered else "⚠️ Not Delivered (DMs Closed / User Left)",
+                inline=True
+            )
             log_embed.add_field(name="Channel Topic", value=channel.topic or "*None*", inline=False)
             log_embed.set_footer(text="Project-Edith • Security Audit Vault")
 
             try:
-                await log_channel.send(embed=log_embed, file=discord_file)
+                await log_channel.send(embed=log_embed, file=staff_file)
             except Exception as e:
-                print(f"[TRANSCRIPT DISPATCH ERROR] {e}")
+                print(f"[STAFF LOG DISPATCH ERROR] {e}")
 
-        # 3. Final countdown & channel deletion
+        # 4. Final countdown and deletion
         await channel.send("🔒 **Archive complete.** Deleting channel in 5 seconds...")
         await asyncio.sleep(5)
         try:
-            await channel.delete(reason=f"Closed by {interaction.user} (Transcript archived)")
+            await channel.delete(reason=f"Closed by {interaction.user} (Transcript archived & DM dispatched)")
         except Exception:
             pass
 
@@ -363,7 +409,7 @@ class TicketPluginView(discord.ui.View):
         await interaction.response.send_modal(BotComplaintModal())
 
 
-# --- Ticket Cog Definition ---
+# --- Cog Definition ---
 class Tickets(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -392,7 +438,10 @@ class Tickets(commands.Cog):
 
         embed.add_field(
             name="🔒 Privacy & Security",
-            value="All channels are locked and restricted exclusively to **you**, the **Directorate**, and **Server Administrators**.\nUpon closure, an encrypted transcript is archived to director records.",
+            value=(
+                "All channels are restricted exclusively to **you**, the **Directorate**, and **Server Administrators**.\n"
+                "Upon closing, an audit transcript is logged to staff records and a copy is sent to your DMs."
+            ),
             inline=False
         )
         embed.set_footer(text="Click a button below to launch a private channel")
