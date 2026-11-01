@@ -9,7 +9,6 @@ from discord.ext import commands
 from datetime import datetime, timezone
 import config
 
-# --- Pool of Randomized Interview Questions for Team Applications ---
 TEAM_QUESTION_POOL = [
     "What motivated you to apply for our staff team?",
     "How many hours per week can you actively dedicate to the server?",
@@ -22,7 +21,6 @@ TEAM_QUESTION_POOL = [
 ]
 
 
-# --- Helper: Locate Staff / Director Log Channel ---
 def get_director_log_channel(guild: discord.Guild):
     """Finds the most suitable channel for archiving transcripts."""
     log_id = int(os.getenv("TICKET_LOGS_CHANNEL_ID", getattr(config, "TICKET_LOGS_CHANNEL_ID", 0)))
@@ -43,7 +41,6 @@ def get_director_log_channel(guild: discord.Guild):
     return None
 
 
-# --- Helper: Generate Text Transcript ---
 async def generate_channel_transcript(channel: discord.TextChannel) -> tuple[io.BytesIO, int]:
     """Scrapes message history chronologically and formats into a UTF-8 text file."""
     messages = []
@@ -82,18 +79,15 @@ async def generate_channel_transcript(channel: discord.TextChannel) -> tuple[io.
     return buffer, len(messages)
 
 
-# --- Helper: Extract Creator ID from Topic ---
 def extract_creator_id(topic: str) -> int | None:
-    """Extracts numeric user ID from topic string format: Creator: User (123456789)"""
     if not topic:
         return None
     match = re.search(r"\((\d{15,21})\)", topic)
     return int(match.group(1)) if match else None
 
 
-# --- Helper: Create Isolated, Locked Channel with Staff Role Ping ---
 async def create_locked_channel(interaction: discord.Interaction, prefix: str, title: str, fields: list[tuple[str, str]], color: discord.Color):
-    """Provisions a private channel visible ONLY to the user, Directors, and Admins, and alerts staff."""
+    """Provisions a private locked channel, alerts Directors, and provides active controls."""
     guild = interaction.guild
     member = interaction.user
     timestamp = datetime.now(timezone.utc).strftime("%H%M")
@@ -105,14 +99,12 @@ async def create_locked_channel(interaction: discord.Interaction, prefix: str, t
         guild.me: discord.PermissionOverwrite(view_channel=True, read_messages=True, send_messages=True, manage_channels=True)
     }
 
-    # Locate Director role
     director_role = discord.utils.get(guild.roles, name=config.DIRECTOR_ROLE_NAME)
     if director_role:
         overwrites[director_role] = discord.PermissionOverwrite(
             view_channel=True, read_messages=True, send_messages=True, manage_channels=True
         )
 
-    # Permit server administrators
     for role in guild.roles:
         if role.permissions.administrator or role.name.lower() in ["admin", "administrator", "head mod"]:
             overwrites[role] = discord.PermissionOverwrite(view_channel=True, read_messages=True, send_messages=True)
@@ -135,11 +127,9 @@ async def create_locked_channel(interaction: discord.Interaction, prefix: str, t
 
     embed.set_footer(text="Project-Edith • Private Dispatch")
 
-    # Build ping content: alert both the user and the Director role
+    notification_content = f"🔔 Notification: {member.mention}"
     if director_role:
-        notification_content = f"🔔 Notification: {member.mention} | {director_role.mention}"
-    else:
-        notification_content = f"🔔 Notification: {member.mention} | *(Director role `{config.DIRECTOR_ROLE_NAME}` not found)*"
+        notification_content += f" | {director_role.mention}"
 
     await channel.send(
         content=notification_content,
@@ -300,7 +290,7 @@ class BotComplaintModal(discord.ui.Modal, title="⚠️ Bot Complaint / Bug Repo
         await interaction.followup.send(f"✅ Your complaint has been submitted privately: {channel.mention}", ephemeral=True)
 
 
-# --- Persistent Inside-Channel Controls (Claim / Close with Transcripts) ---
+# --- Persistent Inside-Channel Controls ---
 class ActiveTicketControls(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -320,12 +310,10 @@ class ActiveTicketControls(discord.ui.View):
 
         await channel.send("📑 Compiling full audit transcript and dispatching records...")
 
-        # 1. Generate text transcript buffer
         buffer, count = await generate_channel_transcript(channel)
         raw_bytes = buffer.getvalue()
         filename = f"transcript-{channel.name}-{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.txt"
 
-        # 2. Dispatch transcript copy to User's Direct Messages
         dm_delivered = False
         creator_id = extract_creator_id(channel.topic)
         if creator_id:
@@ -361,7 +349,6 @@ class ActiveTicketControls(discord.ui.View):
                     print(f"[USER DM TRANSCRIPT ERROR] {e}")
                     dm_delivered = False
 
-        # 3. Transmit transcript copy to Director Logging Channel
         log_channel = get_director_log_channel(interaction.guild)
         if log_channel:
             staff_file = discord.File(io.BytesIO(raw_bytes), filename=filename)
@@ -387,7 +374,6 @@ class ActiveTicketControls(discord.ui.View):
             except Exception as e:
                 print(f"[STAFF LOG DISPATCH ERROR] {e}")
 
-        # 4. Final countdown and deletion
         await channel.send("🔒 **Archive complete.** Deleting channel in 5 seconds...")
         await asyncio.sleep(5)
         try:
@@ -422,10 +408,11 @@ class TicketPluginView(discord.ui.View):
 class Tickets(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self.active_view = TicketPluginView()
 
     async def cog_load(self):
-        """Self-registers persistent views so buttons work across restarts without circular imports."""
-        self.bot.add_view(TicketPluginView())
+        """Self-registers persistent views once so buttons work across restarts without duplicates."""
+        self.bot.add_view(self.active_view)
         self.bot.add_view(ActiveTicketControls())
 
     def create_panel_embed(self) -> discord.Embed:
@@ -461,17 +448,17 @@ class Tickets(commands.Cog):
     async def prefix_panel(self, ctx: commands.Context):
         """Deploy the complete Dispatch Hub: .ticket_panel"""
         embed = self.create_panel_embed()
-        await ctx.channel.send(embed=embed, view=TicketPluginView())
         try:
             await ctx.message.delete()
         except Exception:
             pass
+        await ctx.channel.send(embed=embed, view=self.active_view)
 
     @app_commands.command(name="ticket_panel", description="Deploy the Server Dispatch & Assistance Hub panel.")
     @app_commands.checks.has_permissions(administrator=True)
     async def slash_panel(self, interaction: discord.Interaction):
         embed = self.create_panel_embed()
-        await interaction.channel.send(embed=embed, view=TicketPluginView())
+        await interaction.channel.send(embed=embed, view=self.active_view)
         await interaction.response.send_message("Dispatch hub deployed.", ephemeral=True)
 
 async def setup(bot):
