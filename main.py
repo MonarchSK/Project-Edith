@@ -64,13 +64,10 @@ class UtilityBot(commands.Bot):
         self.restore_report["is_fresh"] = True
 
     async def setup_hook(self):
-        # 1. Download database snapshot BEFORE opening local SQLite handle
         await self.restore_database_from_discord()
-
-        # 2. Establish SQLite connection
         self.db = await aiosqlite.connect(DB_PATH)
 
-        # 3. Ensure all table schemas exist
+        # Base tables
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS birthdays (
                 user_id INTEGER PRIMARY KEY,
@@ -105,9 +102,17 @@ class UtilityBot(commands.Bot):
                 last_channel_id INTEGER DEFAULT 0
             )
         """)
+        # Snapshot table for weekly delta calculations
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS weekly_level_snapshots (
+                user_id INTEGER PRIMARY KEY,
+                snapshot_xp INTEGER DEFAULT 0,
+                snapshot_messages INTEGER DEFAULT 0,
+                snapshot_voice INTEGER DEFAULT 0
+            )
+        """)
         await self.db.commit()
 
-        # 4. Load extensions safely once (NO circular imports, views self-register in cog_load)
         if not self._extensions_loaded:
             cogs_dir = os.path.join(os.path.dirname(__file__), "cogs")
             if os.path.exists(cogs_dir):
@@ -122,7 +127,6 @@ class UtilityBot(commands.Bot):
                                 print(f"[COG ERROR] Failed loading {cog_name}: {e}", file=sys.stderr)
             self._extensions_loaded = True
 
-        # 5. Sync Slash Commands
         try:
             synced = await self.tree.sync()
             print(f"[SLASH] Synced {len(synced)} slash commands.")
