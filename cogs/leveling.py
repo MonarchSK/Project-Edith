@@ -12,6 +12,14 @@ MSG_XP_MIN = 15
 MSG_XP_MAX = 25
 VOICE_XP_PER_MINUTE = 10
 
+# Milestone rewards mapping: level -> (role_name, role_color_hex)
+MILESTONE_ROLES = {
+    5: ("Bronze Operative", 0xCD7F32),
+    10: ("Silver Operative", 0xC0C0C0),
+    25: ("Gold Operative", 0xFFD700),
+    50: ("Mythic Pinnacle", 0x9B59B6)
+}
+
 
 def calculate_xp_for_level(level: int) -> int:
     """Standard progressive XP curve capped at level 50."""
@@ -36,11 +44,41 @@ class Leveling(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.msg_cooldowns = {}   # {user_id: timestamp}
-        self.voice_tracking = {}   # {user_id: join_timestamp}
+        self.voice_tracking = {}  # {user_id: join_timestamp}
         self.voice_xp_loop.start()
 
     def cog_unload(self):
         self.voice_xp_loop.cancel()
+
+    async def _assign_milestone_roles(self, member: discord.Member, current_level: int) -> list[str]:
+        """Ensures all milestone roles up to the current level are assigned to the member."""
+        awarded_role_names = []
+        guild = member.guild
+
+        for milestone_lvl, (role_name, role_color) in sorted(MILESTONE_ROLES.items()):
+            if current_level >= milestone_lvl:
+                # Find role or create if not present
+                role = discord.utils.get(guild.roles, name=role_name)
+                if not role:
+                    try:
+                        role = await guild.create_role(
+                            name=role_name,
+                            color=discord.Color(role_color),
+                            reason=f"Automated Level {milestone_lvl} Milestone Role"
+                        )
+                    except discord.Forbidden:
+                        print(f"[ROLE ERROR] Missing permissions to create role '{role_name}'.")
+                        continue
+
+                # Assign role if member does not have it yet
+                if role not in member.roles:
+                    try:
+                        await member.add_roles(role, reason=f"Level {milestone_lvl} milestone reached")
+                        awarded_role_names.append(role.name)
+                    except discord.Forbidden:
+                        print(f"[ROLE ERROR] Missing hierarchy permissions to give '{role_name}' to {member.name}.")
+
+        return awarded_role_names
 
     async def get_or_create_user(self, user_id: int, username: str) -> dict:
         async with self.bot.db.execute(
@@ -75,8 +113,8 @@ class Leveling(commands.Cog):
         }
 
     async def add_xp(self, user: discord.Member, amount: int, reason: str = "Activity", channel: discord.TextChannel = None):
-        """Grants XP to member, calculates level progression, and handles notifications."""
-        if user.bot:
+        """Grants XP to member, calculates level progression, awards milestone roles, and announces level-ups."""
+        if user.bot or not isinstance(user, discord.Member):
             return
 
         data = await self.get_or_create_user(user.id, user.display_name)
@@ -85,6 +123,7 @@ class Leveling(commands.Cog):
 
         new_xp = data["xp"] + amount
         current_level = data["level"]
+        old_level = current_level
         leveled_up = False
 
         while current_level < MAX_LEVEL:
@@ -107,13 +146,15 @@ class Leveling(commands.Cog):
         """, (new_xp, current_level, user.display_name, user.id))
         await self.bot.db.commit()
 
-        # Mark backup engine as modified
+        # Mark backup engine as modified for queued snapshotting
         backup_cog = self.bot.get_cog("DiscordMemoryBackup")
         if backup_cog and hasattr(backup_cog, "mark_dirty"):
             backup_cog.mark_dirty()
 
-        # Announce level-up
+        # Handle level up and milestone role awards
         if leveled_up:
+            new_roles_awarded = await self._assign_milestone_roles(user, current_level)
+
             target_chan = channel
             if not target_chan and config.ANNOUNCEMENT_CHANNEL_ID:
                 target_chan = self.bot.get_channel(config.ANNOUNCEMENT_CHANNEL_ID)
@@ -121,13 +162,27 @@ class Leveling(commands.Cog):
             if target_chan:
                 embed = discord.Embed(
                     title="🎉 LEVEL ADVANCEMENT!",
-                    description=f"Congratulations {user.mention}! You have achieved **Level {current_level} / {MAX_LEVEL}**!",
+                    description=f"Congratulations {user.mention}! You advanced from **Level {old_level}** to **Level {current_level} / {MAX_LEVEL}**!",
                     color=discord.Color.gold()
                 )
+
+                if new_roles_awarded:
+                    roles_formatted = ", ".join([f"**{r}**" for r in new_roles_awarded])
+                    embed.add_field(
+                        name="🎖️ Milestone Reward Unlocked!",
+                        value=f"You have been granted: {roles_formatted}",
+                        inline=False
+                    )
+
                 if current_level == MAX_LEVEL:
-                    embed.add_field(name="👑 MAX LEVEL REACHED", value="You have attained the pinnacle rank!", inline=False)
+                    embed.add_field(
+                        name="👑 PINNACLE REACHED",
+                        value="You have achieved the ultimate rank of Level 50! Maximum respect.",
+                        inline=False
+                    )
+
                 embed.set_thumbnail(url=user.display_avatar.url)
-                embed.set_footer(text="Project-Edith • Leveling Matrix")
+                embed.set_footer(text="Project-Edith • Level Progression")
                 try:
                     await target_chan.send(embed=embed)
                 except Exception:
@@ -139,7 +194,7 @@ class Leveling(commands.Cog):
         if message.author.bot or not message.guild:
             return
 
-        # Ignore bot commands
+        # Ignore bot prefix commands
         if message.content.startswith("."):
             return
 
@@ -166,21 +221,17 @@ class Leveling(commands.Cog):
         if member.bot:
             return
 
-        # Member joined an active voice channel
         if not before.channel and after.channel:
             self.voice_tracking[member.id] = time.time()
-
-        # Member left voice channel
         elif before.channel and not after.channel:
             self.voice_tracking.pop(member.id, None)
 
     @tasks.loop(minutes=1)
     async def voice_xp_loop(self):
         """Iterates over voice channels, awarding XP to eligible members."""
-        now = time.time()
         for guild in self.bot.guilds:
             for vc in guild.voice_channels:
-                # Do not give voice XP if user is alone or in AFK channel
+                # Disqualify if user is alone or in AFK channel
                 if len(vc.members) < 2 or vc == guild.afk_channel:
                     continue
 
@@ -188,7 +239,6 @@ class Leveling(commands.Cog):
                     if member.bot or member.voice.self_deaf or member.voice.deaf:
                         continue
 
-                    # Award 1 minute voice XP
                     await self.bot.db.execute("""
                         INSERT INTO levels (user_id, user_name, xp, level, messages_count, voice_minutes)
                         VALUES (?, ?, 0, 1, 0, 1)
@@ -212,7 +262,6 @@ class Leveling(commands.Cog):
         needed = calculate_xp_for_level(data["level"])
         bar = get_progress_bar(data["xp"], needed)
 
-        # Calculate server leaderboard position
         async with self.bot.db.execute("""
             SELECT user_id FROM levels ORDER BY level DESC, xp DESC
         """) as cursor:
@@ -236,8 +285,17 @@ class Leveling(commands.Cog):
         embed.add_field(name="📈 Progress to Level Up", value=f"`{bar}`", inline=False)
         embed.add_field(name="💬 Messages", value=f"`{data['messages_count']}`", inline=True)
         embed.add_field(name="🎙️ Voice Time", value=f"`{data['voice_minutes']} mins`", inline=True)
-        embed.set_footer(text="Project-Edith • Level Progression")
 
+        # Show next milestone role preview
+        upcoming_milestones = [lvl for lvl in sorted(MILESTONE_ROLES.keys()) if lvl > data["level"]]
+        if upcoming_milestones:
+            next_lvl = upcoming_milestones[0]
+            role_name = MILESTONE_ROLES[next_lvl][0]
+            embed.add_field(name="🎯 Next Role Unlock", value=f"**{role_name}** at Level `{next_lvl}`", inline=False)
+        else:
+            embed.add_field(name="👑 Rank Status", value="All milestone roles unlocked!", inline=False)
+
+        embed.set_footer(text="Project-Edith • Level Progression")
         await ctx.send(embed=embed)
 
     @app_commands.command(name="rank", description="Check your rank, level, and XP progression.")
@@ -270,8 +328,16 @@ class Leveling(commands.Cog):
         embed.add_field(name="📈 Progress to Level Up", value=f"`{bar}`", inline=False)
         embed.add_field(name="💬 Messages", value=f"`{data['messages_count']}`", inline=True)
         embed.add_field(name="🎙️ Voice Time", value=f"`{data['voice_minutes']} mins`", inline=True)
-        embed.set_footer(text="Project-Edith • Level Progression")
 
+        upcoming_milestones = [lvl for lvl in sorted(MILESTONE_ROLES.keys()) if lvl > data["level"]]
+        if upcoming_milestones:
+            next_lvl = upcoming_milestones[0]
+            role_name = MILESTONE_ROLES[next_lvl][0]
+            embed.add_field(name="🎯 Next Role Unlock", value=f"**{role_name}** at Level `{next_lvl}`", inline=False)
+        else:
+            embed.add_field(name="👑 Rank Status", value="All milestone roles unlocked!", inline=False)
+
+        embed.set_footer(text="Project-Edith • Level Progression")
         await interaction.response.send_message(embed=embed)
 
     # --- Leaderboard Command ---
@@ -337,6 +403,31 @@ class Leveling(commands.Cog):
         embed.add_field(name="Rankings", value="\n\n".join(lines), inline=False)
         embed.set_footer(text="Project-Edith • Leveling Matrix")
         await interaction.response.send_message(embed=embed)
+
+    # --- Director Master Command to Manually Set Levels (For Testing) ---
+    @commands.command(name="setlevel")
+    @commands.has_permissions(administrator=True)
+    async def set_level_cmd(self, ctx: commands.Context, member: discord.Member, target_level: int):
+        """Admin command to manually adjust member levels: .setlevel @user 10"""
+        if not (1 <= target_level <= MAX_LEVEL):
+            await ctx.send(f"❌ Level must be between 1 and {MAX_LEVEL}.")
+            return
+
+        await self.get_or_create_user(member.id, member.display_name)
+        await self.bot.db.execute("""
+            UPDATE levels
+            SET level = ?, xp = 0
+            WHERE user_id = ?
+        """, (target_level, member.id))
+        await self.bot.db.commit()
+
+        # Sync milestone roles immediately
+        awarded = await self._assign_milestone_roles(member, target_level)
+        msg = f"✅ Set {member.mention}'s rank to **Level {target_level}**."
+        if awarded:
+            msg += f" Assigned roles: {', '.join(awarded)}"
+        await ctx.send(msg)
+
 
 async def setup(bot):
     await bot.add_cog(Leveling(bot))
