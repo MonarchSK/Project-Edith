@@ -7,9 +7,9 @@ from discord.ext import commands, tasks
 from datetime import datetime, timezone
 import config
 
-BUMP_COOLDOWN_SECONDS = 7200      # 2 Hours
-PRE_REMINDER_SECONDS = 6300       # 1 Hour 45 Minutes (15 minutes before ready)
-BUMP_XP_REWARD = 200              # 200 XP per bump
+BUMP_COOLDOWN_SECONDS = 7200
+PRE_REMINDER_SECONDS = 6300
+BUMP_XP_REWARD = 200
 BUMP_PING_ROLE_NAME = getattr(config, "BUMP_PING_ROLE_NAME", "Bump Pings")
 
 
@@ -24,7 +24,6 @@ async def get_or_create_bump_role(guild: discord.Guild) -> discord.Role | None:
                 reason="Automated Bump Notification Role"
             )
         except discord.Forbidden:
-            print(f"[BUMP ERROR] Lacking permissions to create role '{BUMP_PING_ROLE_NAME}'.")
             return None
     return role
 
@@ -43,8 +42,6 @@ class BumpRoleToggleView(discord.ui.View):
         try:
             if not interaction.response.is_done():
                 await interaction.response.defer(ephemeral=True)
-        except discord.NotFound:
-            return
         except Exception:
             pass
 
@@ -53,29 +50,21 @@ class BumpRoleToggleView(discord.ui.View):
 
         role = await get_or_create_bump_role(guild)
         if not role:
-            msg = "⚠️ Could not manage the Bump Pings role due to missing permissions."
-            try:
-                await interaction.followup.send(msg, ephemeral=True)
-            except Exception:
-                await interaction.channel.send(f"{member.mention} {msg}", delete_after=5)
+            await interaction.followup.send("⚠️ Could not manage role due to permissions.", ephemeral=True)
             return
 
         if role in member.roles:
             try:
-                await member.remove_roles(role, reason="Self-service bump ping opt-out")
-                await interaction.followup.send("🔕 You have removed the **Bump Pings** role. You will no longer be alerted.", ephemeral=True)
+                await member.remove_roles(role, reason="Opt-out bump pings")
+                await interaction.followup.send("🔕 You have removed the **Bump Pings** role.", ephemeral=True)
             except discord.Forbidden:
-                await interaction.followup.send("❌ Discord rejected role removal. Edith's role must be above the Bump Pings role.", ephemeral=True)
-            except Exception:
-                pass
+                await interaction.followup.send("❌ Discord rejected role change. Ensure Edith's role is higher.", ephemeral=True)
         else:
             try:
-                await member.add_roles(role, reason="Self-service bump ping opt-in")
-                await interaction.followup.send("🔔 **Bump Pings role assigned!** You will be notified 15 minutes before and when the server is ready to bump.", ephemeral=True)
+                await member.add_roles(role, reason="Opt-in bump pings")
+                await interaction.followup.send("🔔 **Bump Pings role assigned!**", ephemeral=True)
             except discord.Forbidden:
-                await interaction.followup.send("❌ Discord rejected role assignment. Edith's role must be above the Bump Pings role.", ephemeral=True)
-            except Exception:
-                pass
+                await interaction.followup.send("❌ Discord rejected role change. Ensure Edith's role is higher.", ephemeral=True)
 
 
 class Bumping(commands.Cog):
@@ -85,8 +74,6 @@ class Bumping(commands.Cog):
 
     async def cog_load(self):
         self.bot.add_view(BumpRoleToggleView())
-
-        # Ensure pre_reminder_sent column exists
         try:
             await self.bot.db.execute("ALTER TABLE bump_status ADD COLUMN pre_reminder_sent INTEGER DEFAULT 1")
             await self.bot.db.commit()
@@ -104,7 +91,6 @@ class Bumping(commands.Cog):
             return await cursor.fetchone()
 
     def trigger_instant_backup(self, bumper_name: str):
-        """Immediately syncs the new bump timestamp into Discord persistent cloud backup."""
         backup_cog = self.bot.get_cog("DiscordMemoryBackup")
         if backup_cog and hasattr(backup_cog, "upload_backup_and_prune"):
             asyncio.create_task(
@@ -125,7 +111,6 @@ class Bumping(commands.Cog):
                 time_str = f"{hours}h {minutes}m {seconds}s" if hours > 0 else f"{minutes}m {seconds}s"
                 return False, time_str, remaining_secs
 
-        # Persist bump timestamp and reset flags
         await self.bot.db.execute("""
             INSERT INTO bump_status (guild_id, last_bump_timestamp, last_bumper_id, reminder_sent, last_channel_id, pre_reminder_sent)
             VALUES (?, ?, ?, 0, ?, 0)
@@ -138,19 +123,15 @@ class Bumping(commands.Cog):
         """, (guild.id, now, user.id, channel.id))
         await self.bot.db.commit()
 
-        # Award bumper XP
         leveling_cog = self.bot.get_cog("Leveling")
         if leveling_cog:
             await leveling_cog.add_xp(user, BUMP_XP_REWARD, reason="Server Bump Reward", channel=channel)
 
-        # Force immediate cloud backup to lock in timestamp
         self.trigger_instant_backup(user.name)
-
         return True, "Success", 0
 
     @commands.command(name="bump")
     async def prefix_bump(self, ctx: commands.Context):
-        """Bump the server to earn 200 XP and boost server ranking."""
         success, time_str, remaining = await self.execute_bump(ctx.guild, ctx.author, ctx.channel)
         if not success:
             embed = discord.Embed(
@@ -183,15 +164,11 @@ class Bumping(commands.Cog):
 
     @app_commands.command(name="bump", description="Bump the server to earn 200 XP and boost ranking.")
     async def slash_bump(self, interaction: discord.Interaction):
-        # 1. Attempt non-blocking defer with fallback handling
         deferred = False
         try:
             await interaction.response.defer()
             deferred = True
-        except discord.NotFound:
-            # Token expired before execution reached Render
-            deferred = False
-        except discord.HTTPException:
+        except Exception:
             deferred = interaction.response.is_done()
 
         success, time_str, remaining = await self.execute_bump(interaction.guild, interaction.user, interaction.channel)
@@ -229,7 +206,6 @@ class Bumping(commands.Cog):
             embed.set_thumbnail(url=interaction.guild.icon.url)
         embed.set_footer(text="Project-Edith • Persistent Bump Engine")
 
-        # 2. Try followup dispatch; if token is dead, cleanly dispatch straight to channel
         if deferred:
             try:
                 await interaction.followup.send(embed=embed, view=BumpRoleToggleView())
@@ -239,7 +215,6 @@ class Bumping(commands.Cog):
 
         await interaction.channel.send(embed=embed, view=BumpRoleToggleView())
 
-    # --- Background Loop: Handles Exact Timestamp Alignment Even Across Restarts ---
     @tasks.loop(seconds=15)
     async def check_bump_reminder(self):
         now = int(time.time())
@@ -268,7 +243,6 @@ class Bumping(commands.Cog):
             bump_role = await get_or_create_bump_role(guild)
             role_ping = bump_role.mention if bump_role else ""
 
-            # 1. 15-Minute Advance Reminder (Between 1h45m and 2h)
             if diff >= PRE_REMINDER_SECONDS and diff < BUMP_COOLDOWN_SECONDS and pre_reminder_sent == 0:
                 await self.bot.db.execute("UPDATE bump_status SET pre_reminder_sent = 1 WHERE guild_id = ?", (gid,))
                 await self.bot.db.commit()
@@ -295,7 +269,6 @@ class Bumping(commands.Cog):
                 except Exception as e:
                     print(f"[BUMP PRE-REMINDER ERROR] {e}")
 
-            # 2. 2-Hour Cooldown Ready Notification
             elif diff >= BUMP_COOLDOWN_SECONDS and reminder_sent == 0:
                 await self.bot.db.execute("UPDATE bump_status SET reminder_sent = 1, pre_reminder_sent = 1 WHERE guild_id = ?", (gid,))
                 await self.bot.db.commit()
@@ -309,7 +282,7 @@ class Bumping(commands.Cog):
                     color=discord.Color.from_rgb(0, 168, 252),
                     timestamp=datetime.now(timezone.utc)
                 )
-                embed.set_footer(text="Click 'Toggle Bump Pings' below to manage your alerts")
+                embed.set_footer(text="Click 'Toggle Bump Pings' below to manage alerts")
 
                 bumper = guild.get_member(bumper_id)
                 ping_content = f"📢 {role_ping}"
