@@ -40,13 +40,24 @@ class BumpRoleToggleView(discord.ui.View):
         custom_id="btn_toggle_bump_ping_role"
     )
     async def toggle_role(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=True)
+        except discord.NotFound:
+            return
+        except Exception:
+            pass
+
         guild = interaction.guild
         member = interaction.user
 
         role = await get_or_create_bump_role(guild)
         if not role:
-            await interaction.followup.send("⚠️ Could not manage the Bump Pings role due to missing permissions.", ephemeral=True)
+            msg = "⚠️ Could not manage the Bump Pings role due to missing permissions."
+            try:
+                await interaction.followup.send(msg, ephemeral=True)
+            except Exception:
+                await interaction.channel.send(f"{member.mention} {msg}", delete_after=5)
             return
 
         if role in member.roles:
@@ -55,12 +66,16 @@ class BumpRoleToggleView(discord.ui.View):
                 await interaction.followup.send("🔕 You have removed the **Bump Pings** role. You will no longer be alerted.", ephemeral=True)
             except discord.Forbidden:
                 await interaction.followup.send("❌ Discord rejected role removal. Edith's role must be above the Bump Pings role.", ephemeral=True)
+            except Exception:
+                pass
         else:
             try:
                 await member.add_roles(role, reason="Self-service bump ping opt-in")
                 await interaction.followup.send("🔔 **Bump Pings role assigned!** You will be notified 15 minutes before and when the server is ready to bump.", ephemeral=True)
             except discord.Forbidden:
                 await interaction.followup.send("❌ Discord rejected role assignment. Edith's role must be above the Bump Pings role.", ephemeral=True)
+            except Exception:
+                pass
 
 
 class Bumping(commands.Cog):
@@ -168,15 +183,32 @@ class Bumping(commands.Cog):
 
     @app_commands.command(name="bump", description="Bump the server to earn 200 XP and boost ranking.")
     async def slash_bump(self, interaction: discord.Interaction):
-        await interaction.response.defer()
+        # 1. Attempt non-blocking defer with fallback handling
+        deferred = False
+        try:
+            await interaction.response.defer()
+            deferred = True
+        except discord.NotFound:
+            # Token expired before execution reached Render
+            deferred = False
+        except discord.HTTPException:
+            deferred = interaction.response.is_done()
+
         success, time_str, remaining = await self.execute_bump(interaction.guild, interaction.user, interaction.channel)
+
         if not success:
             embed = discord.Embed(
                 title="⏳ Bump Cooldown Active",
                 description=f"This server was already bumped recently!\nYou can bump again in **{time_str}** (<t:{int(time.time()) + remaining}:R>).",
                 color=discord.Color.red()
             )
-            await interaction.followup.send(embed=embed, view=BumpRoleToggleView())
+            if deferred:
+                try:
+                    await interaction.followup.send(embed=embed, view=BumpRoleToggleView())
+                    return
+                except Exception:
+                    pass
+            await interaction.channel.send(embed=embed, view=BumpRoleToggleView())
             return
 
         next_bump_epoch = int(time.time()) + BUMP_COOLDOWN_SECONDS
@@ -197,7 +229,15 @@ class Bumping(commands.Cog):
             embed.set_thumbnail(url=interaction.guild.icon.url)
         embed.set_footer(text="Project-Edith • Persistent Bump Engine")
 
-        await interaction.followup.send(embed=embed, view=BumpRoleToggleView())
+        # 2. Try followup dispatch; if token is dead, cleanly dispatch straight to channel
+        if deferred:
+            try:
+                await interaction.followup.send(embed=embed, view=BumpRoleToggleView())
+                return
+            except Exception:
+                pass
+
+        await interaction.channel.send(embed=embed, view=BumpRoleToggleView())
 
     # --- Background Loop: Handles Exact Timestamp Alignment Even Across Restarts ---
     @tasks.loop(seconds=15)
