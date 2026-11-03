@@ -254,7 +254,7 @@ class Moderation(commands.Cog):
             await member.kick(reason=f"Kicked by {ctx.author.name}: {reason}")
             embed = discord.Embed(
                 title="👢 Member Kicked",
-                description=f"{member.mention} (`{member.id}`) was kicked by {ctx.author.mention}.\n**Reason:** {reason}",
+                description=f"{member.mention} (`{member.id}`)\n**Reason:** {reason}",
                 color=discord.Color.orange(),
                 timestamp=datetime.now(timezone.utc)
             )
