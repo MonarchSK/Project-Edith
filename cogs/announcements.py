@@ -6,38 +6,30 @@ import config
 
 
 def is_announcement_authorized(member: discord.Member) -> bool:
-    """Verifies that the user holds Admin, Director, or explicit Authority status."""
     if not isinstance(member, discord.Member):
         return False
-
     if member.guild_permissions.administrator:
         return True
-
     director_role = getattr(config, "DIRECTOR_ROLE_NAME", "Director").lower()
     allowed_roles = {director_role, "authority", "admin", "administrator", "head mod"}
     return any(r.name.lower() in allowed_roles for r in member.roles)
 
 
 def get_target_channel(guild: discord.Guild, channel: discord.TextChannel = None) -> discord.TextChannel:
-    """Determines target channel, prioritizing selected channel then config ID."""
     if channel:
         return channel
-
     announcement_id = int(getattr(config, "ANNOUNCEMENT_CHANNEL_ID", 0))
     if announcement_id:
         target = guild.get_channel(announcement_id)
         if target:
             return target
-
     for name in ["announcements", "updates", "news"]:
         target = discord.utils.get(guild.text_channels, name=name)
         if target:
             return target
-
     return guild.system_channel or guild.text_channels[0]
 
 
-# --- Broadcast Confirmation Preview View ---
 class BroadcastConfirmView(discord.ui.View):
     def __init__(self, author: discord.Member, target_channel: discord.TextChannel, embed: discord.Embed, ping_str: str = None):
         super().__init__(timeout=180)
@@ -48,14 +40,13 @@ class BroadcastConfirmView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author.id:
-            await interaction.response.send_message("⛔ Only the authorized author can confirm this broadcast.", ephemeral=True)
+            await interaction.response.send_message("⛔ Only the author can confirm this broadcast.", ephemeral=True)
             return False
         return True
 
     @discord.ui.button(label="Broadcast Now", style=discord.ButtonStyle.success, emoji="🚀")
     async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
-
         for item in self.children:
             item.disabled = True
         await interaction.edit_original_response(view=self)
@@ -66,8 +57,6 @@ class BroadcastConfirmView(discord.ui.View):
         try:
             await self.target_channel.send(content=content, embed=self.embed, allowed_mentions=allowed_mentions)
             await interaction.followup.send(f"✅ Announcement successfully broadcasted to {self.target_channel.mention}!", ephemeral=True)
-        except discord.Forbidden:
-            await interaction.followup.send(f"❌ Failed to dispatch. Edith lacks permission to send messages in {self.target_channel.mention}.", ephemeral=True)
         except Exception as e:
             await interaction.followup.send(f"⚠️ Broadcast error: `{e}`", ephemeral=True)
 
@@ -78,7 +67,6 @@ class BroadcastConfirmView(discord.ui.View):
         await interaction.response.edit_message(content="🗑️ Announcement preview discarded.", embed=None, view=self)
 
 
-# --- Custom Announcement Interactive Modal ---
 class AnnouncementModal(discord.ui.Modal):
     announcement_title = discord.ui.TextInput(
         label="Announcement Title",
@@ -89,19 +77,19 @@ class AnnouncementModal(discord.ui.Modal):
     announcement_body = discord.ui.TextInput(
         label="Message Content (Supports Markdown)",
         style=discord.TextStyle.paragraph,
-        placeholder="Type the full announcement content here...",
+        placeholder="Type announcement content here...",
         max_length=3000,
         required=True
     )
     ping_mention = discord.ui.TextInput(
         label="Ping Option (@everyone, @here, Role, None)",
-        placeholder="e.g. @everyone or Leave blank for no ping",
+        placeholder="e.g. @everyone or leave blank",
         max_length=80,
         required=False
     )
     banner_url = discord.ui.TextInput(
         label="Banner Image URL (Optional)",
-        placeholder="https://example.com/banner.png (or blank)",
+        placeholder="https://example.com/banner.png",
         max_length=300,
         required=False
     )
@@ -120,7 +108,6 @@ class AnnouncementModal(discord.ui.Modal):
             timestamp=datetime.now(timezone.utc)
         )
 
-        # Apply custom image or configured banner fallback
         banner = self.banner_url.value.strip()
         if banner and (banner.startswith("http://") or banner.startswith("https://")):
             embed.set_image(url=banner)
@@ -136,7 +123,6 @@ class AnnouncementModal(discord.ui.Modal):
         )
 
         ping_str = self.ping_mention.value.strip() if self.ping_mention.value else None
-
         preview_view = BroadcastConfirmView(
             author=interaction.user,
             target_channel=self.target_channel,
@@ -158,9 +144,8 @@ class Announcements(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    # --- Slash Command: /announce [channel] ---
     @app_commands.command(name="announce", description="Broadcast a formal server announcement (High Authority only).")
-    @app_commands.describe(channel="Target channel for announcement (Defaults to configured announcements)")
+    @app_commands.describe(channel="Target channel for announcement")
     async def slash_announce(self, interaction: discord.Interaction, channel: discord.TextChannel = None):
         if not is_announcement_authorized(interaction.user):
             embed = discord.Embed(
@@ -174,16 +159,14 @@ class Announcements(commands.Cog):
         destination = get_target_channel(interaction.guild, channel)
         await interaction.response.send_modal(AnnouncementModal(target_channel=destination))
 
-    # --- Prefix Command: .announce [#channel] ---
     @commands.command(name="announce", aliases=["broadcast"])
     async def prefix_announce(self, ctx: commands.Context, channel: discord.TextChannel = None):
-        """Deploy the announcement builder modal or check authority status."""
         if not is_announcement_authorized(ctx.author):
             try:
                 await ctx.message.delete()
             except Exception:
                 pass
-            await ctx.send("⛔ **Access Denied:** Only Administrators, Directors, and Authority roles may broadcast announcements.", delete_after=5)
+            await ctx.send("⛔ **Access Denied:** Only Administrators, Directors, and Authority roles may broadcast.", delete_after=5)
             return
 
         destination = get_target_channel(ctx.guild, channel)
@@ -194,10 +177,7 @@ class Announcements(commands.Cog):
 
         embed = discord.Embed(
             title="📢 Launch Announcement Studio",
-            description=(
-                f"Ready to draft an official broadcast for {destination.mention}.\n\n"
-                f"Click the button below to open the **Draft Studio** or run `/announce` directly."
-            ),
+            description=f"Ready to draft an official broadcast for {destination.mention}.\nClick the button below to open the **Draft Studio**.",
             color=discord.Color.blue()
         )
 
@@ -212,7 +192,6 @@ class Announcements(commands.Cog):
 
         btn.callback = btn_callback
         view.add_item(btn)
-
         await ctx.send(embed=embed, view=view)
 
 
