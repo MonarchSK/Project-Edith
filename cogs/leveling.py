@@ -21,6 +21,7 @@ DROP_CHANCE = 0.03
 DROP_XP_MIN = 10
 DROP_XP_MAX = 1000
 DROP_TIMEOUT_SECONDS = 90
+CLAIM_AUTODELETE_SECONDS = 10  # Claimed message disappears after 10 seconds
 
 MILESTONE_ROLES = {
     5: ("Bronze Operative", 0xCD7F32),
@@ -62,6 +63,15 @@ class XpDropClaimView(discord.ui.View):
         self.claimed = False
         self.message = None
 
+    async def _auto_delete_after_delay(self, msg: discord.Message, delay: int = CLAIM_AUTODELETE_SECONDS):
+        """Waits for the delay and silently purges the claimed message."""
+        await asyncio.sleep(delay)
+        try:
+            if msg:
+                await msg.delete()
+        except Exception:
+            pass
+
     @discord.ui.button(label="Claim XP Drop", style=discord.ButtonStyle.success, emoji="🎁", custom_id="btn_claim_xp_drop")
     async def claim_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.claimed:
@@ -84,15 +94,20 @@ class XpDropClaimView(discord.ui.View):
             title="🎁 XP Drop Claimed!",
             description=(
                 f"**{user.mention}** reacted first and claimed **+{self.xp_amount} XP**!\n"
-                + (f"🚀 *Booster 1.5x Multiplier applied: Received **+{awarded_xp} XP**!*" if is_server_booster(user) else "")
+                + (f"🚀 *Booster 1.5x Multiplier applied: Received **+{awarded_xp} XP**!*\n" if is_server_booster(user) else "")
+                + f"\n⏳ *This message will automatically disappear in {CLAIM_AUTODELETE_SECONDS} seconds.*"
             ),
             color=discord.Color.gold(),
             timestamp=datetime.now(timezone.utc)
         )
         embed.set_thumbnail(url=user.display_avatar.url)
-        embed.set_footer(text="Project-Edith • Supply Drop Claimed")
+        embed.set_footer(text=f"Project-Edith • Purging in {CLAIM_AUTODELETE_SECONDS}s")
 
         await interaction.response.edit_message(embed=embed, view=self)
+
+        # Launch non-blocking auto-delete task
+        target_msg = self.message or interaction.message
+        asyncio.create_task(self._auto_delete_after_delay(target_msg, delay=CLAIM_AUTODELETE_SECONDS))
 
     async def on_timeout(self):
         if not self.claimed and self.message:
@@ -101,11 +116,12 @@ class XpDropClaimView(discord.ui.View):
                 child.label = "Expired"
             embed = discord.Embed(
                 title="📦 XP Drop Expired",
-                description="Nobody claimed this supply drop in time. Better luck next time!",
+                description="Nobody claimed this supply drop in time. Better luck next time!\n\n⏳ *Disappearing in 5 seconds.*",
                 color=discord.Color.dark_grey()
             )
             try:
                 await self.message.edit(embed=embed, view=self)
+                asyncio.create_task(self._auto_delete_after_delay(self.message, delay=5))
             except Exception:
                 pass
 
@@ -357,9 +373,7 @@ class Leveling(commands.Cog):
         msg = await channel.send(embed=embed, view=view)
         view.message = msg
 
-    # --- Weekly Report Builder ---
     async def generate_weekly_report_embed(self, guild: discord.Guild) -> discord.Embed:
-        """Compiles weekly community ranking and statistics."""
         async with self.bot.db.execute("""
             SELECT user_id, user_name, level, xp, messages_count, voice_minutes
             FROM levels
@@ -386,7 +400,6 @@ class Leveling(commands.Cog):
         if guild.icon:
             embed.set_thumbnail(url=guild.icon.url)
 
-        # Star Operatives
         if top_typer and top_typer[4] > 0:
             embed.add_field(
                 name="💬 Chat Champion",
@@ -400,7 +413,6 @@ class Leveling(commands.Cog):
                 inline=True
             )
 
-        # Top 5 Overall Leaderboard
         lines = []
         medals = ["🥇", "🥈", "🥉", "🎖️", "🎖️"]
         for idx, (uid, name, lvl, xp, msgs, voice) in enumerate(all_records[:5]):
@@ -420,11 +432,9 @@ class Leveling(commands.Cog):
         embed.set_footer(text="Project-Edith • Weekly Automated Digest")
         return embed
 
-    # --- Automated Sunday Midnight Loop ---
     @tasks.loop(hours=1)
     async def weekly_report_loop(self):
         now = datetime.now(timezone.utc)
-        # Trigger on Sunday (weekday 6) at 00:00 UTC
         if now.weekday() == 6 and now.hour == 0:
             announcement_id = int(getattr(config, "ANNOUNCEMENT_CHANNEL_ID", 0))
             if not announcement_id:
@@ -443,7 +453,6 @@ class Leveling(commands.Cog):
     async def before_weekly_report(self):
         await self.bot.wait_until_ready()
 
-    # --- Commands ---
     @commands.command(name="weeklyreport", aliases=["levelreport", "weekly_report"])
     @commands.has_permissions(administrator=True)
     async def prefix_weekly_report(self, ctx: commands.Context):
