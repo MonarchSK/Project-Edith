@@ -6,13 +6,10 @@ import config
 
 
 def is_welcome_authorized(member: discord.Member) -> bool:
-    """Verifies that the user holds Admin, Director, or explicit Authority status."""
     if not isinstance(member, discord.Member):
         return False
-
     if member.guild_permissions.administrator:
         return True
-
     director_role = getattr(config, "DIRECTOR_ROLE_NAME", "Director").lower()
     allowed_roles = {director_role, "authority", "admin", "administrator", "head mod"}
     return any(r.name.lower() in allowed_roles for r in member.roles)
@@ -22,20 +19,15 @@ class WelcomePortalView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(
-        label="Server Rules",
-        style=discord.ButtonStyle.secondary,
-        emoji="📜",
-        custom_id="btn_welcome_view_rules"
-    )
+    @discord.ui.button(label="Server Rules", style=discord.ButtonStyle.secondary, emoji="📜", custom_id="btn_welcome_view_rules")
     async def rules_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         embed = discord.Embed(
             title="📜 Server Directives & Code of Conduct",
             description=(
-                "**1. Respect Everyone:** Zero tolerance for toxicity, hate speech, or targeted harassment.\n"
-                "**2. Keep Channels On-Topic:** Use appropriate channels for gaming, media, commands, and bots.\n"
-                "**3. No Unauthorized Promotion:** Direct invites, advertising, or solicitation in DMs is banned.\n"
-                "**4. Respect Discord ToS:** Follow all Discord Community Guidelines and Terms of Service.\n"
+                "**1. Respect Everyone:** Zero tolerance for toxicity, hate speech, or harassment.\n"
+                "**2. Keep Channels On-Topic:** Use appropriate channels for media, commands, and bots.\n"
+                "**3. No Unauthorized Promotion:** Advertising or solicitation in DMs is banned.\n"
+                "**4. Respect Discord ToS:** Follow all Discord Community Guidelines.\n"
                 "**5. Staff Authority:** Decisions made by Administrators and Directors are final."
             ),
             color=discord.Color.from_rgb(88, 101, 242)
@@ -43,21 +35,16 @@ class WelcomePortalView(discord.ui.View):
         embed.set_footer(text="Project-Edith • Moderation Protocols")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @discord.ui.button(
-        label="Channel Directory",
-        style=discord.ButtonStyle.secondary,
-        emoji="🧭",
-        custom_id="btn_welcome_view_directory"
-    )
+    @discord.ui.button(label="Channel Directory", style=discord.ButtonStyle.secondary, emoji="🧭", custom_id="btn_welcome_view_directory")
     async def directory_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild = interaction.guild
         embed = discord.Embed(
             title="🧭 Server Navigation Directory",
             description=(
-                f"Welcome to **{guild.name}**! Here is where you find everything:\n\n"
-                f"• **💬 General Lounge:** Main discussion & active hangout hub.\n"
+                f"Welcome to **{guild.name}**! Quick navigation links:\n\n"
+                f"• **💬 General Lounge:** Main discussion & hangout hub.\n"
                 f"• **🎙️ Voice Lounges:** Low-latency voice, gaming lobbies, and party chats.\n"
-                f"• **🎁 Giveaways:** Special events, XP milestones, and Nitro prize draws.\n"
+                f"• **🎁 Giveaways:** Special events, XP milestones, and Nitro draws.\n"
                 f"• **🛠️ Support Desk:** Open a private ticket with staff at any time.\n"
                 f"• **🏷️ Identity Studio:** Customize your nickname and cosmetic colors."
             ),
@@ -66,12 +53,7 @@ class WelcomePortalView(discord.ui.View):
         embed.set_footer(text="Project-Edith • Community Map")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @discord.ui.button(
-        label="Operative Roles",
-        style=discord.ButtonStyle.success,
-        emoji="🎨",
-        custom_id="btn_welcome_view_roles"
-    )
+    @discord.ui.button(label="Operative Roles", style=discord.ButtonStyle.success, emoji="🎨", custom_id="btn_welcome_view_roles")
     async def roles_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         embed = discord.Embed(
             title="🎨 Roles, Perks & Progression",
@@ -93,7 +75,6 @@ class Welcome(commands.Cog):
         self.portal_view = WelcomePortalView()
 
     async def cog_load(self):
-        """Self-registers persistent view so action buttons survive bot restarts."""
         self.bot.add_view(self.portal_view)
 
     def create_welcome_embed(self, guild: discord.Guild) -> discord.Embed:
@@ -101,7 +82,7 @@ class Welcome(commands.Cog):
             title=f"🌐 WELCOME TO {guild.name.upper()}!",
             description=(
                 f"Welcome to **{guild.name}** — your premiere destination for community hangouts, "
-                f"casual and competitive gaming, active voice lounges, exclusive giveaways, and events!\n\n"
+                f"gaming lobbies, active voice lounges, exclusive giveaways, and events!\n\n"
                 f"Whether you're looking to squad up for games, share media, earn XP milestones, or relax in voice, "
                 f"you have found your new digital home."
             ),
@@ -112,7 +93,6 @@ class Welcome(commands.Cog):
         if guild.icon:
             embed.set_thumbnail(url=guild.icon.url)
 
-        # 1. Use dedicated WELCOME_BANNER, falling back to COLOR_BANNER or TICKET_BANNER
         banner_url = (
             getattr(config, "WELCOME_BANNER", None)
             or getattr(config, "COLOR_BANNER", None)
@@ -152,8 +132,8 @@ class Welcome(commands.Cog):
             name="🛠️ 4. Identity Studio & Assistance",
             value=(
                 "• **Level 10+ Nicknames:** Unlock custom alias modification in our Identity Studio.\n"
-                "• **Birthday Tracking:** Register your birthday to receive an automated community celebration.\n"
-                "• **Staff Dispatch:** Need help? Open a private ticket with our Directorate team anytime."
+                "• **Birthday Tracking:** Register your birthday to receive an automated celebration.\n"
+                "• **Staff Dispatch:** Open a private ticket with our Directorate team anytime."
             ),
             inline=False
         )
@@ -164,7 +144,6 @@ class Welcome(commands.Cog):
         )
         return embed
 
-    # --- Slash Command: /welcome [channel] ---
     @app_commands.command(name="welcome", description="Post the official long-form server welcome guide into a designated channel.")
     @app_commands.describe(channel="Channel where the welcome message should be published")
     async def slash_welcome(self, interaction: discord.Interaction, channel: discord.TextChannel = None):
@@ -178,7 +157,6 @@ class Welcome(commands.Cog):
             return
 
         await interaction.response.defer(ephemeral=True)
-
         target_channel = channel or interaction.channel
         embed = self.create_welcome_embed(interaction.guild)
 
@@ -186,14 +164,12 @@ class Welcome(commands.Cog):
             await target_channel.send(embed=embed, view=self.portal_view)
             await interaction.followup.send(f"✅ Official server welcome guide deployed to {target_channel.mention}!", ephemeral=True)
         except discord.Forbidden:
-            await interaction.followup.send(f"❌ Missing permissions to send messages or embed links in {target_channel.mention}.", ephemeral=True)
+            await interaction.followup.send(f"❌ Missing permissions to send messages in {target_channel.mention}.", ephemeral=True)
         except Exception as e:
             await interaction.followup.send(f"⚠️ Failed to dispatch welcome message: `{e}`", ephemeral=True)
 
-    # --- Prefix Command: .welcome [#channel] ---
     @commands.command(name="welcome", aliases=["postwelcome", "welcomepanel"])
     async def prefix_welcome(self, ctx: commands.Context, channel: discord.TextChannel = None):
-        """Deploy the official server welcome guide: .welcome or .welcome #welcome"""
         if not is_welcome_authorized(ctx.author):
             try:
                 await ctx.message.delete()
