@@ -46,6 +46,7 @@ class DiscordMemoryBackup(commands.Cog):
         return temp
 
     async def prune_stale_backups(self, channel: discord.TextChannel):
+        """Scans channel history and deletes all backups except the 3 newest."""
         try:
             valid_backups = []
             async for msg in channel.history(limit=50):
