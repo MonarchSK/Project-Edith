@@ -38,6 +38,7 @@ class UtilityBot(commands.Bot):
         }
 
     async def restore_database_from_discord(self):
+        """Retrieves and restores the latest database snapshot from Discord cloud backup."""
         backup_id = int(os.getenv("BACKUP_CHANNEL_ID", getattr(config, "BACKUP_CHANNEL_ID", 0)))
         if not backup_id or backup_id == 0:
             print("[RESTORE] BACKUP_CHANNEL_ID is unset. Starting clean local database.")
@@ -72,9 +73,13 @@ class UtilityBot(commands.Bot):
         self.restore_report["is_fresh"] = True
 
     async def setup_hook(self):
+        # 1. Download snapshot from Discord channel
         await self.restore_database_from_discord()
+
+        # 2. Establish SQLite connection
         self.db = await aiosqlite.connect(DB_PATH)
 
+        # 3. Create all schema tables
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS birthdays (
                 user_id INTEGER PRIMARY KEY,
@@ -125,9 +130,19 @@ class UtilityBot(commands.Bot):
                 last_reviver_id INTEGER DEFAULT 0
             )
         """)
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS warnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                moderator_id INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         await self.db.commit()
 
-        # Dynamic loading without double-load bug
+        # 4. Dynamically load extensions without double-loading
         if not self._extensions_loaded:
             cogs_dir = os.path.join(os.path.dirname(__file__), "cogs")
             if os.path.exists(cogs_dir):
@@ -144,6 +159,7 @@ class UtilityBot(commands.Bot):
                                 print(f"[COG ERROR] Failed loading {cog_name}: {e}", file=sys.stderr)
             self._extensions_loaded = True
 
+        # 5. Global sync of slash commands
         try:
             synced = await self.tree.sync()
             self.slash_sync_count = len(synced)
@@ -153,6 +169,7 @@ class UtilityBot(commands.Bot):
             print(f"[SLASH ERROR] Slash command sync failed: {e}", file=sys.stderr)
 
     async def get_or_create_error_log_channel(self, guild: discord.Guild) -> discord.TextChannel | None:
+        """Finds or creates the designated bot-errors channel."""
         err_id = int(os.getenv("BOT_ERRORS_CHANNEL_ID", getattr(config, "BOT_ERRORS_CHANNEL_ID", 0)))
         if err_id:
             chan = guild.get_channel(err_id)
@@ -184,9 +201,11 @@ class UtilityBot(commands.Bot):
             return None
 
     async def run_diagnostic_suite(self, guild: discord.Guild) -> tuple[discord.Embed, bool]:
+        """Runs validation checks across all subsystems and outputs a status report."""
         tests = []
         overall_healthy = True
 
+        # Database Check
         try:
             start_t = time.perf_counter()
             async with self.db.execute("SELECT 1") as cursor:
@@ -201,6 +220,7 @@ class UtilityBot(commands.Bot):
             tests.append(("Database Read/Write", f"❌ FAIL ({e})"))
             overall_healthy = False
 
+        # Cloud Backup Check
         backup_id = int(os.getenv("BACKUP_CHANNEL_ID", getattr(config, "BACKUP_CHANNEL_ID", 0)))
         if backup_id:
             b_chan = guild.get_channel(backup_id)
@@ -216,6 +236,7 @@ class UtilityBot(commands.Bot):
         else:
             tests.append(("Cloud Backup Vault", "⚠️ WARN (Channel Unset)"))
 
+        # Director Role Check
         director_name = getattr(config, "DIRECTOR_ROLE_NAME", "Director")
         director_role = discord.utils.get(guild.roles, name=director_name)
         if director_role:
@@ -223,6 +244,7 @@ class UtilityBot(commands.Bot):
         else:
             tests.append(("Authority Hierarchy", f"⚠️ WARN (@{director_name} missing)"))
 
+        # Cogs Check
         failed_cogs = [name for name, status in self.cog_load_status.items() if status != "OK"]
         if not failed_cogs:
             tests.append(("Plugin Cog Suite", f"✅ PASS ({len(self.cog_load_status)} cogs)"))
