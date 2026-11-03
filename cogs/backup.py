@@ -36,7 +36,8 @@ class DiscordMemoryBackup(commands.Cog):
             except Exception:
                 pass
 
-        src = sqlite3.connect(DB_PATH, timeout=20.0)
+        # Connect with URI read-only flag to prevent locking against live aiosqlite
+        src = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=15.0)
         dst = sqlite3.connect(temp)
         with dst:
             src.backup(dst, pages=100)
@@ -64,18 +65,29 @@ class DiscordMemoryBackup(commands.Cog):
         except Exception as e:
             print(f"[BACKUP PRUNE ERROR] {e}")
 
-    async def upload_backup_and_prune(self, reason: str = "Routine Sync"):
+    async def upload_backup_and_prune(self, reason: str = "Routine Sync") -> tuple[bool, str]:
+        """Thread-safe snapshot export to #bot-memory with instant pruning of older backups."""
         async with self.backup_lock:
             backup_id = int(os.getenv("BACKUP_CHANNEL_ID", getattr(config, "BACKUP_CHANNEL_ID", 0)))
-            if not backup_id:
-                return
+            if not backup_id or backup_id == 0:
+                err = "BACKUP_CHANNEL_ID is unset or 0 in config/env."
+                print(f"[BACKUP ERROR] {err}")
+                return False, err
 
             channel = self.bot.get_channel(backup_id)
             if not channel:
                 try:
                     channel = await self.bot.fetch_channel(backup_id)
-                except Exception:
-                    return
+                except Exception as e:
+                    err = f"Could not find or fetch backup channel (ID: {backup_id}): {e}"
+                    print(f"[BACKUP ERROR] {err}")
+                    return False, err
+
+            perms = channel.permissions_for(channel.guild.me)
+            if not perms.send_messages or not perms.attach_files:
+                err = f"Missing Send Messages or Attach Files permission in #{channel.name}."
+                print(f"[BACKUP ERROR] {err}")
+                return False, err
 
             try:
                 loop = asyncio.get_running_loop()
@@ -83,7 +95,6 @@ class DiscordMemoryBackup(commands.Cog):
 
                 now_utc = datetime.now(timezone.utc)
                 filename = f"backup_{now_utc.strftime('%Y%m%d_%H%M%S')}.db"
-                discord_file = discord.File(temp_file, filename=filename)
 
                 b_count, l_count, c_count, bump_info = 0, 0, 0, "None"
                 try:
@@ -113,18 +124,25 @@ class DiscordMemoryBackup(commands.Cog):
                 embed.add_field(name="Confessions", value=f"`{c_count}`", inline=True)
                 embed.set_footer(text="Project-Edith • Persistent Storage Engine")
 
-                await channel.send(embed=embed, file=discord_file)
+                with open(temp_file, "rb") as f:
+                    discord_file = discord.File(f, filename=filename)
+                    await channel.send(embed=embed, file=discord_file)
 
                 if os.path.exists(temp_file):
-                    os.remove(temp_file)
+                    try:
+                        os.remove(temp_file)
+                    except Exception:
+                        pass
 
                 self.last_backup_time = now_utc.timestamp()
                 self.is_dirty = False
             except Exception as e:
-                print(f"[BACKUP UPLOAD ERROR] {e}")
-                return
+                err = f"Failed during snapshot creation or upload: {e}"
+                print(f"[BACKUP UPLOAD ERROR] {err}")
+                return False, err
 
             await self.prune_stale_backups(channel)
+            return True, "Success"
 
     def mark_dirty(self, reason: str = "Database Mutation"):
         self.is_dirty = True
@@ -149,8 +167,11 @@ class DiscordMemoryBackup(commands.Cog):
     @commands.has_permissions(administrator=True)
     async def manual_backup_cmd(self, ctx: commands.Context):
         msg = await ctx.send("⏳ Generating snapshot and dispatching to `#bot-memory`...")
-        await self.upload_backup_and_prune(reason=f"Manual execution by {ctx.author.name}")
-        await msg.edit(content=f"✅ Database snapshot stored and older backups pruned (retaining last {KEEP_BACKUP_COUNT}).")
+        success, detail = await self.upload_backup_and_prune(reason=f"Manual execution by {ctx.author.name}")
+        if success:
+            await msg.edit(content=f"✅ **Database snapshot successfully stored!** Older backups pruned (retaining last {KEEP_BACKUP_COUNT}).")
+        else:
+            await msg.edit(content=f"❌ **Backup Failed:** `{detail}`")
 
 
 async def setup(bot):
