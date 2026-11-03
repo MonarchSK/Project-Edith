@@ -1,3 +1,4 @@
+import os
 import asyncio
 import discord
 from discord import app_commands
@@ -10,7 +11,6 @@ CONFIRMATION_DELETE_DELAY = 5
 
 
 def is_mod_authorized(member: discord.Member) -> bool:
-    """Verifies that the user holds Admin, Director, or Moderator privileges."""
     if not isinstance(member, discord.Member):
         return False
     if member.guild_permissions.administrator or member.guild_permissions.ban_members:
@@ -22,7 +22,6 @@ def is_mod_authorized(member: discord.Member) -> bool:
 
 
 def parse_time_duration(time_str: str) -> int:
-    """Parses duration strings like 10m, 2h, 1d into seconds."""
     unit = time_str[-1].lower()
     try:
         val = int(time_str[:-1])
@@ -38,7 +37,6 @@ class Moderation(commands.Cog):
         self.bot = bot
 
     async def log_mod_action(self, embed: discord.Embed):
-        """Dispatches an audit record to the configured staff log channel."""
         log_id = int(os.getenv("TICKET_LOGS_CHANNEL_ID", getattr(config, "TICKET_LOGS_CHANNEL_ID", 0)))
         if not log_id:
             return
@@ -50,7 +48,6 @@ class Moderation(commands.Cog):
                 pass
 
     async def check_hierarchy(self, actor: discord.Member, target: discord.Member) -> bool:
-        """Returns True if actor outranks target in Discord role hierarchy."""
         if target == actor:
             return False
         if target.id == actor.guild.owner_id:
@@ -59,9 +56,6 @@ class Moderation(commands.Cog):
             return True
         return actor.top_role > target.top_role
 
-    # =========================================================================
-    # PURGE COMMANDS
-    # =========================================================================
     async def execute_purge(self, channel: discord.TextChannel, amount: int, target_member: discord.Member = None) -> int:
         def check_filter(msg: discord.Message) -> bool:
             return msg.author.id == target_member.id if target_member else True
@@ -97,12 +91,8 @@ class Moderation(commands.Cog):
         except Exception:
             pass
 
-    # =========================================================================
-    # WARN SYSTEM
-    # =========================================================================
     @commands.command(name="warn")
     async def prefix_warn(self, ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"):
-        """Issue an official infraction: .warn @user spamming"""
         if not is_mod_authorized(ctx.author):
             await ctx.send("⛔ You do not have authority to issue warnings.", delete_after=4)
             return
@@ -117,12 +107,10 @@ class Moderation(commands.Cog):
         """, (ctx.guild.id, member.id, ctx.author.id, reason))
         await self.bot.db.commit()
 
-        # Mark memory backup engine dirty
         backup_cog = self.bot.get_cog("DiscordMemoryBackup")
         if backup_cog and hasattr(backup_cog, "mark_dirty"):
             backup_cog.mark_dirty(reason="User Warning Registered")
 
-        # Total user warnings count
         async with self.bot.db.execute(
             "SELECT COUNT(*) FROM warnings WHERE guild_id = ? AND user_id = ?",
             (ctx.guild.id, member.id)
@@ -145,7 +133,6 @@ class Moderation(commands.Cog):
 
     @commands.command(name="warnings", aliases=["warns"])
     async def prefix_warnings(self, ctx: commands.Context, member: discord.Member = None):
-        """View recorded infractions for a member: .warnings @user"""
         target = member or ctx.author
         async with self.bot.db.execute("""
             SELECT id, moderator_id, reason, timestamp FROM warnings
@@ -167,7 +154,12 @@ class Moderation(commands.Cog):
 
         entries = []
         for wid, mod_id, reason, stamp in rows[:10]:
-            entries.append(f"• **ID #{wid}** | <@{mod_id}>: `{reason}` (<t:{int(datetime.fromisoformat(stamp).timestamp())}:R>)")
+            try:
+                epoch = int(datetime.fromisoformat(stamp).timestamp())
+                time_display = f"<t:{epoch}:R>"
+            except Exception:
+                time_display = stamp
+            entries.append(f"• **ID #{wid}** | <@{mod_id}>: `{reason}` ({time_display})")
 
         embed.description = f"Total Warnings: **{len(rows)}**\n\n" + "\n".join(entries)
         await ctx.send(embed=embed)
@@ -175,7 +167,6 @@ class Moderation(commands.Cog):
     @commands.command(name="clearwarns")
     @commands.has_permissions(administrator=True)
     async def prefix_clearwarns(self, ctx: commands.Context, member: discord.Member):
-        """Clear all warnings for a user: .clearwarns @user"""
         await self.bot.db.execute("DELETE FROM warnings WHERE guild_id = ? AND user_id = ?", (ctx.guild.id, member.id))
         await self.bot.db.commit()
 
@@ -191,12 +182,8 @@ class Moderation(commands.Cog):
         await ctx.send(embed=embed)
         await self.log_mod_action(embed)
 
-    # =========================================================================
-    # TIMEOUT / MUTE SYSTEM
-    # =========================================================================
     @commands.command(name="mute", aliases=["timeout"])
     async def prefix_mute(self, ctx: commands.Context, member: discord.Member, duration: str = "10m", *, reason: str = "Rule violation"):
-        """Mute a user using native Discord timeout: .mute @user 30m excessive caps"""
         if not is_mod_authorized(ctx.author):
             await ctx.send("⛔ Access Denied: Moderation authority required.", delete_after=4)
             return
@@ -206,7 +193,7 @@ class Moderation(commands.Cog):
             return
 
         secs = parse_time_duration(duration)
-        if secs <= 0 or secs > 2419200:  # Discord timeout limit is 28 days
+        if secs <= 0 or secs > 2419200:
             await ctx.send("❌ Invalid duration. Use format like `10m`, `2h`, `1d` (max 28 days).", delete_after=5)
             return
 
@@ -231,7 +218,6 @@ class Moderation(commands.Cog):
 
     @commands.command(name="unmute", aliases=["untimeout"])
     async def prefix_unmute(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Timeout lifted early"):
-        """Remove timeout early: .unmute @user"""
         if not is_mod_authorized(ctx.author):
             await ctx.send("⛔ Access Denied.", delete_after=4)
             return
@@ -249,12 +235,8 @@ class Moderation(commands.Cog):
         except Exception as e:
             await ctx.send(f"❌ Failed to lift timeout: `{e}`", delete_after=5)
 
-    # =========================================================================
-    # KICK & BAN SYSTEM
-    # =========================================================================
     @commands.command(name="kick")
     async def prefix_kick(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Violating server directives"):
-        """Kick a member: .kick @user disruption"""
         if not is_mod_authorized(ctx.author):
             await ctx.send("⛔ Access Denied.", delete_after=4)
             return
@@ -283,7 +265,6 @@ class Moderation(commands.Cog):
 
     @commands.command(name="ban")
     async def prefix_ban(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Severe infraction / ban"):
-        """Ban a member: .ban @user severe violation"""
         if not is_mod_authorized(ctx.author):
             await ctx.send("⛔ Access Denied.", delete_after=4)
             return
@@ -312,7 +293,6 @@ class Moderation(commands.Cog):
 
     @commands.command(name="unban")
     async def prefix_unban(self, ctx: commands.Context, user_id: int, *, reason: str = "Pardon / Appeal accepted"):
-        """Unban a member by ID: .unban 123456789012345678"""
         if not is_mod_authorized(ctx.author):
             await ctx.send("⛔ Access Denied.", delete_after=4)
             return
@@ -332,104 +312,6 @@ class Moderation(commands.Cog):
             await ctx.send(f"❌ User ID `{user_id}` is not currently banned.", delete_after=5)
         except Exception as e:
             await ctx.send(f"❌ Failed to unban user: `{e}`", delete_after=5)
-
-    # =========================================================================
-    # SLASH COMMAND VERSIONS
-    # =========================================================================
-    @app_commands.command(name="warn", description="Issue a warning infraction to a member.")
-    @app_commands.describe(member="Member to warn", reason="Reason for infraction")
-    async def slash_warn(self, interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
-        if not is_mod_authorized(interaction.user):
-            await interaction.response.send_message("⛔ Moderation authority required.", ephemeral=True)
-            return
-        if not await self.check_hierarchy(interaction.user, member):
-            await interaction.response.send_message("❌ Target outranks you.", ephemeral=True)
-            return
-
-        await interaction.response.defer()
-        await self.bot.db.execute("INSERT INTO warnings (guild_id, user_id, moderator_id, reason) VALUES (?, ?, ?, ?)", (interaction.guild.id, member.id, interaction.user.id, reason))
-        await self.bot.db.commit()
-
-        backup_cog = self.bot.get_cog("DiscordMemoryBackup")
-        if backup_cog and hasattr(backup_cog, "mark_dirty"):
-            backup_cog.mark_dirty(reason="User Warning Registered")
-
-        async with self.bot.db.execute("SELECT COUNT(*) FROM warnings WHERE guild_id = ? AND user_id = ?", (interaction.guild.id, member.id)) as cur:
-            count = (await cur.fetchone())[0]
-
-        try:
-            await member.send(f"⚠️ You received a formal warning in **{interaction.guild.name}**:\n**Reason:** {reason}\n**Total Warnings:** {count}")
-        except Exception:
-            pass
-
-        embed = discord.Embed(
-            title="⚠️ Infraction Issued",
-            description=f"{member.mention} was warned by {interaction.user.mention}.\n**Reason:** {reason}\n**Total Warnings:** `{count}`",
-            color=discord.Color.gold(),
-            timestamp=datetime.now(timezone.utc)
-        )
-        await interaction.followup.send(embed=embed)
-        await self.log_mod_action(embed)
-
-    @app_commands.command(name="mute", description="Timeout/mute a member for a specified duration.")
-    @app_commands.describe(member="Member to silence", duration="Duration (e.g., 10m, 2h, 1d)", reason="Reason for timeout")
-    async def slash_mute(self, interaction: discord.Interaction, member: discord.Member, duration: str = "10m", reason: str = "Rule violation"):
-        if not is_mod_authorized(interaction.user):
-            await interaction.response.send_message("⛔ Moderation authority required.", ephemeral=True)
-            return
-        if not await self.check_hierarchy(interaction.user, member):
-            await interaction.response.send_message("❌ Target outranks you in role hierarchy.", ephemeral=True)
-            return
-
-        secs = parse_time_duration(duration)
-        if secs <= 0 or secs > 2419200:
-            await interaction.response.send_message("❌ Duration must be between 1 minute and 28 days (e.g. 10m, 2h, 1d).", ephemeral=True)
-            return
-
-        await interaction.response.defer()
-        until = datetime.now(timezone.utc) + timedelta(seconds=secs)
-
-        try:
-            await member.timeout(until, reason=f"By {interaction.user.name}: {reason}")
-            embed = discord.Embed(
-                title="🔇 Member Timed Out",
-                description=f"{member.mention} silenced for **{duration}** (<t:{int(until.timestamp())}:R>).\n**Reason:** {reason}\n**Moderator:** {interaction.user.mention}",
-                color=discord.Color.red(),
-                timestamp=datetime.now(timezone.utc)
-            )
-            await interaction.followup.send(embed=embed)
-            await self.log_mod_action(embed)
-        except discord.Forbidden:
-            await interaction.followup.send("❌ Discord rejected timeout. Edith's role must be above the member's role.", ephemeral=True)
-
-    @app_commands.command(name="ban", description="Permanently ban a member from the server.")
-    @app_commands.describe(member="Member to ban", reason="Reason for ban")
-    async def slash_ban(self, interaction: discord.Interaction, member: discord.Member, reason: str = "Severe infraction"):
-        if not is_mod_authorized(interaction.user):
-            await interaction.response.send_message("⛔ Moderation authority required.", ephemeral=True)
-            return
-        if not await self.check_hierarchy(interaction.user, member):
-            await interaction.response.send_message("❌ Target outranks you.", ephemeral=True)
-            return
-
-        await interaction.response.defer()
-        try:
-            await member.send(f"🔨 You have been banned from **{interaction.guild.name}**.\n**Reason:** {reason}")
-        except Exception:
-            pass
-
-        try:
-            await interaction.guild.ban(member, reason=f"Banned by {interaction.user.name}: {reason}", delete_message_days=1)
-            embed = discord.Embed(
-                title="🔨 Member Banned",
-                description=f"{member.mention} (`{member.id}`) was banned by {interaction.user.mention}.\n**Reason:** {reason}",
-                color=discord.Color.dark_red(),
-                timestamp=datetime.now(timezone.utc)
-            )
-            await interaction.followup.send(embed=embed)
-            await self.log_mod_action(embed)
-        except discord.Forbidden:
-            await interaction.followup.send("❌ Discord permission error: Ensure Edith's top role is above the target.", ephemeral=True)
 
 
 async def setup(bot):
