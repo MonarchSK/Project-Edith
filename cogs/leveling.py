@@ -14,14 +14,13 @@ MSG_COOLDOWN_SECONDS = 60
 MSG_XP_MIN = 15
 MSG_XP_MAX = 25
 VOICE_XP_PER_MINUTE = 10
-BOOSTER_XP_MULTIPLIER = 1.5  # 1.5x XP Boost for Server Boosters
+BOOSTER_XP_MULTIPLIER = 1.5
 
-# Random XP Drop Settings
 DROP_CHANCE = 0.03
 DROP_XP_MIN = 10
 DROP_XP_MAX = 1000
 DROP_TIMEOUT_SECONDS = 90
-CLAIM_AUTODELETE_SECONDS = 10  # Claimed message disappears after 10 seconds
+CLAIM_AUTODELETE_SECONDS = 10
 
 MILESTONE_ROLES = {
     5: ("Bronze Operative", 0xCD7F32),
@@ -54,7 +53,6 @@ def is_server_booster(member: discord.Member) -> bool:
     return member.premium_since is not None
 
 
-# --- Interactive Random XP Drop View ---
 class XpDropClaimView(discord.ui.View):
     def __init__(self, cog, xp_amount: int):
         super().__init__(timeout=DROP_TIMEOUT_SECONDS)
@@ -64,7 +62,6 @@ class XpDropClaimView(discord.ui.View):
         self.message = None
 
     async def _auto_delete_after_delay(self, msg: discord.Message, delay: int = CLAIM_AUTODELETE_SECONDS):
-        """Waits for the delay and silently purges the claimed message."""
         await asyncio.sleep(delay)
         try:
             if msg:
@@ -105,7 +102,6 @@ class XpDropClaimView(discord.ui.View):
 
         await interaction.response.edit_message(embed=embed, view=self)
 
-        # Launch non-blocking auto-delete task
         target_msg = self.message or interaction.message
         asyncio.create_task(self._auto_delete_after_delay(target_msg, delay=CLAIM_AUTODELETE_SECONDS))
 
@@ -116,7 +112,7 @@ class XpDropClaimView(discord.ui.View):
                 child.label = "Expired"
             embed = discord.Embed(
                 title="📦 XP Drop Expired",
-                description="Nobody claimed this supply drop in time. Better luck next time!\n\n⏳ *Disappearing in 5 seconds.*",
+                description="Nobody claimed this supply drop in time.\n\n⏳ *Disappearing in 5 seconds.*",
                 color=discord.Color.dark_grey()
             )
             try:
@@ -166,7 +162,6 @@ class Leveling(commands.Cog):
                     timeout_counter += 1
 
                 await voice_client.disconnect(force=True)
-
         except Exception as e:
             print(f"[VOICE CHIME NOTICE] Could not play level up audio: {e}")
             if voice_client and voice_client.is_connected():
@@ -190,7 +185,6 @@ class Leveling(commands.Cog):
                             reason=f"Automated Level {milestone_lvl} Milestone Role"
                         )
                     except discord.Forbidden:
-                        print(f"[ROLE ERROR] Missing permissions to create role '{role_name}'.")
                         continue
 
                 if role not in member.roles:
@@ -198,7 +192,7 @@ class Leveling(commands.Cog):
                         await member.add_roles(role, reason=f"Level {milestone_lvl} milestone reached")
                         awarded_role_names.append(role.name)
                     except discord.Forbidden:
-                        print(f"[ROLE ERROR] Missing hierarchy permissions to give '{role_name}' to {member.name}.")
+                        pass
 
         return awarded_role_names
 
@@ -317,7 +311,7 @@ class Leveling(commands.Cog):
                 if current_level == MAX_LEVEL:
                     embed.add_field(
                         name="👑 PINNACLE REACHED",
-                        value="You have achieved the ultimate rank of Level 50! Maximum respect.",
+                        value="You have achieved the ultimate rank of Level 50!",
                         inline=False
                     )
 
@@ -401,17 +395,9 @@ class Leveling(commands.Cog):
             embed.set_thumbnail(url=guild.icon.url)
 
         if top_typer and top_typer[4] > 0:
-            embed.add_field(
-                name="💬 Chat Champion",
-                value=f"<@{top_typer[0]}> (`{top_typer[4]}` msgs)",
-                inline=True
-            )
+            embed.add_field(name="💬 Chat Champion", value=f"<@{top_typer[0]}> (`{top_typer[4]}` msgs)", inline=True)
         if top_voice and top_voice[5] > 0:
-            embed.add_field(
-                name="🎙️ Voice Titan",
-                value=f"<@{top_voice[0]}> (`{top_voice[5]}` mins)",
-                inline=True
-            )
+            embed.add_field(name="🎙️ Voice Titan", value=f"<@{top_voice[0]}> (`{top_voice[5]}` mins)", inline=True)
 
         lines = []
         medals = ["🥇", "🥈", "🥉", "🎖️", "🎖️"]
@@ -456,11 +442,10 @@ class Leveling(commands.Cog):
     @commands.command(name="weeklyreport", aliases=["levelreport", "weekly_report"])
     @commands.has_permissions(administrator=True)
     async def prefix_weekly_report(self, ctx: commands.Context):
-        """Generate and post the Weekly Level Report on demand."""
         embed = await self.generate_weekly_report_embed(ctx.guild)
         await ctx.send(embed=embed)
 
-    @app_commands.command(name="weekly_report", description="Generate and display the Weekly Server Level & Activity Report.")
+    @app_commands.command(name="weekly_report", description="Generate the Weekly Server Level & Activity Report.")
     @app_commands.checks.has_permissions(administrator=True)
     async def slash_weekly_report(self, interaction: discord.Interaction):
         await interaction.response.defer()
@@ -537,9 +522,7 @@ class Leveling(commands.Cog):
         needed = calculate_xp_for_level(data["level"])
         bar = get_progress_bar(data["xp"], needed)
 
-        async with self.bot.db.execute("""
-            SELECT user_id FROM levels ORDER BY level DESC, xp DESC
-        """) as cursor:
+        async with self.bot.db.execute("SELECT user_id FROM levels ORDER BY level DESC, xp DESC") as cursor:
             all_users = await cursor.fetchall()
 
         rank_pos = 1
@@ -564,11 +547,9 @@ class Leveling(commands.Cog):
         embed.add_field(name="🎙️ Voice Time", value=f"`{data['voice_minutes']} mins`", inline=True)
         embed.add_field(name="📈 Progress to Level Up", value=f"`{bar}`", inline=False)
 
-        upcoming_milestones = [lvl for lvl in sorted(MILESTONE_ROLES.keys()) if lvl > data["level"]]
-        if upcoming_milestones:
-            next_lvl = upcoming_milestones[0]
-            role_name = MILESTONE_ROLES[next_lvl][0]
-            embed.add_field(name="🎯 Next Role Unlock", value=f"**{role_name}** at Level `{next_lvl}`", inline=False)
+        upcoming = [lvl for lvl in sorted(MILESTONE_ROLES.keys()) if lvl > data["level"]]
+        if upcoming:
+            embed.add_field(name="🎯 Next Role Unlock", value=f"**{MILESTONE_ROLES[upcoming[0]][0]}** at Level `{upcoming[0]}`", inline=False)
         else:
             embed.add_field(name="👑 Rank Status", value="All milestone roles unlocked!", inline=False)
 
@@ -609,77 +590,13 @@ class Leveling(commands.Cog):
         embed.add_field(name="🎙️ Voice Time", value=f"`{data['voice_minutes']} mins`", inline=True)
         embed.add_field(name="📈 Progress to Level Up", value=f"`{bar}`", inline=False)
 
-        upcoming_milestones = [lvl for lvl in sorted(MILESTONE_ROLES.keys()) if lvl > data["level"]]
-        if upcoming_milestones:
-            next_lvl = upcoming_milestones[0]
-            role_name = MILESTONE_ROLES[next_lvl][0]
-            embed.add_field(name="🎯 Next Role Unlock", value=f"**{role_name}** at Level `{next_lvl}`", inline=False)
+        upcoming = [lvl for lvl in sorted(MILESTONE_ROLES.keys()) if lvl > data["level"]]
+        if upcoming:
+            embed.add_field(name="🎯 Next Role Unlock", value=f"**{MILESTONE_ROLES[upcoming[0]][0]}** at Level `{upcoming[0]}`", inline=False)
         else:
             embed.add_field(name="👑 Rank Status", value="All milestone roles unlocked!", inline=False)
 
         embed.set_footer(text="Project-Edith • Level Progression")
-        await interaction.response.send_message(embed=embed)
-
-    @commands.command(name="leaderboard", aliases=["lb", "top"])
-    async def leaderboard_cmd(self, ctx: commands.Context):
-        async with self.bot.db.execute("""
-            SELECT user_id, user_name, level, xp, messages_count
-            FROM levels
-            ORDER BY level DESC, xp DESC
-            LIMIT 10
-        """) as cursor:
-            rows = await cursor.fetchall()
-
-        if not rows:
-            await ctx.send("No member activity recorded yet.")
-            return
-
-        embed = discord.Embed(
-            title="🏆 Server Activity Leaderboard",
-            description="Top 10 operatives ranked by level and XP:\n",
-            color=discord.Color.gold()
-        )
-
-        lines = []
-        medals = ["🥇", "🥈", "🥉"]
-        for idx, (uid, name, lvl, xp, msgs) in enumerate(rows):
-            medal = medals[idx] if idx < 3 else f"`#{idx + 1}`"
-            display_name = name or f"User {uid}"
-            lines.append(f"{medal} **{display_name}** (<@{uid}>)\n   ↳ Level **{lvl}** • `{xp} XP` • `{msgs} msgs`")
-
-        embed.add_field(name="Rankings", value="\n\n".join(lines), inline=False)
-        embed.set_footer(text="Project-Edith • Leveling Matrix")
-        await ctx.send(embed=embed)
-
-    @app_commands.command(name="leaderboard", description="View the top 10 server members by level and XP.")
-    async def slash_leaderboard(self, interaction: discord.Interaction):
-        async with self.bot.db.execute("""
-            SELECT user_id, user_name, level, xp, messages_count
-            FROM levels
-            ORDER BY level DESC, xp DESC
-            LIMIT 10
-        """) as cursor:
-            rows = await cursor.fetchall()
-
-        if not rows:
-            await interaction.response.send_message("No member activity recorded yet.", ephemeral=True)
-            return
-
-        embed = discord.Embed(
-            title="🏆 Server Activity Leaderboard",
-            description="Top 10 operatives ranked by level and XP:\n",
-            color=discord.Color.gold()
-        )
-
-        lines = []
-        medals = ["🥇", "🥈", "🥉"]
-        for idx, (uid, name, lvl, xp, msgs) in enumerate(rows):
-            medal = medals[idx] if idx < 3 else f"`#{idx + 1}`"
-            display_name = name or f"User {uid}"
-            lines.append(f"{medal} **{display_name}** (<@{uid}>)\n   ↳ Level **{lvl}** • `{xp} XP` • `{msgs} msgs`")
-
-        embed.add_field(name="Rankings", value="\n\n".join(lines), inline=False)
-        embed.set_footer(text="Project-Edith • Leveling Matrix")
         await interaction.response.send_message(embed=embed)
 
     @commands.command(name="dropxp")
@@ -695,17 +612,6 @@ class Leveling(commands.Cog):
             pass
 
         await self.trigger_xp_drop(ctx.channel, amount)
-
-    @app_commands.command(name="dropxp", description="Spawn an interactive XP Drop in the current channel.")
-    @app_commands.describe(amount="Custom XP amount (10-1000). Leave blank for random.")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def slash_manual_drop(self, interaction: discord.Interaction, amount: int = None):
-        if amount and not (10 <= amount <= 1000):
-            await interaction.response.send_message("❌ XP Drop amount must be between 10 and 1,000 XP.", ephemeral=True)
-            return
-
-        await interaction.response.send_message("🎁 Spawning supply drop...", ephemeral=True)
-        await self.trigger_xp_drop(interaction.channel, amount)
 
     @commands.command(name="setlevel")
     @commands.has_permissions(administrator=True)
@@ -727,38 +633,6 @@ class Leveling(commands.Cog):
         if awarded:
             msg += f" Assigned roles: {', '.join(awarded)}"
         await ctx.send(msg)
-
-        announcement_id = int(getattr(config, "ANNOUNCEMENT_CHANNEL_ID", 0))
-        target_chan = self.bot.get_channel(announcement_id) if announcement_id else ctx.channel
-        if target_chan:
-            embed = discord.Embed(
-                title="🎉 LEVEL ADVANCEMENT!",
-                description=f"Congratulations {member.mention}! You advanced to **Level {target_level} / {MAX_LEVEL}**!",
-                color=discord.Color.gold(),
-                timestamp=datetime.now(timezone.utc)
-            )
-            if awarded:
-                embed.add_field(name="🎖️ Milestone Reward Unlocked!", value=", ".join([f"**{r}**" for r in awarded]), inline=False)
-            embed.set_thumbnail(url=member.display_avatar.url)
-            embed.set_footer(text="Project-Edith • Server Leveling Hub")
-
-            ping_content = f"📢 Attention {member.mention}!"
-            alert_role_name = getattr(config, "LEVEL_UP_PING_ROLE_NAME", None)
-            if alert_role_name:
-                alert_role = discord.utils.get(member.guild.roles, name=alert_role_name)
-                if alert_role:
-                    ping_content += f" | {alert_role.mention}"
-
-            try:
-                await target_chan.send(
-                    content=ping_content,
-                    embed=embed,
-                    allowed_mentions=discord.AllowedMentions(roles=True, users=True)
-                )
-            except Exception as e:
-                print(f"[LEVEL UP DISPATCH ERROR] {e}")
-
-        asyncio.create_task(self._play_voice_chime(member))
 
 
 async def setup(bot):
