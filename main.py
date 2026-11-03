@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import asyncio
+import traceback
 import aiosqlite
 import discord
 from discord.ext import commands
@@ -38,7 +39,6 @@ class UtilityBot(commands.Bot):
         }
 
     async def restore_database_from_discord(self):
-        """Retrieves and restores the latest database snapshot from Discord cloud backup."""
         backup_id = int(os.getenv("BACKUP_CHANNEL_ID", getattr(config, "BACKUP_CHANNEL_ID", 0)))
         if not backup_id or backup_id == 0:
             print("[RESTORE] BACKUP_CHANNEL_ID is unset. Starting clean local database.")
@@ -62,7 +62,7 @@ class UtilityBot(commands.Bot):
                             "is_fresh": False,
                             "error": None
                         }
-                        print(f"[RESTORE] Restored persistent storage from '{attachment.filename}' ({round(size_kb, 2)} KB)")
+                        print(f"[RESTORE] Restored storage from '{attachment.filename}' ({round(size_kb, 2)} KB)")
                         return
         except Exception as e:
             err_msg = str(e)
@@ -73,13 +73,13 @@ class UtilityBot(commands.Bot):
         self.restore_report["is_fresh"] = True
 
     async def setup_hook(self):
-        # 1. Download snapshot from Discord channel
         await self.restore_database_from_discord()
-
-        # 2. Establish SQLite connection
         self.db = await aiosqlite.connect(DB_PATH)
 
-        # 3. Create all schema tables
+        # Enable WAL mode to avoid database locks during live snapshots
+        await self.db.execute("PRAGMA journal_mode=WAL;")
+
+        # Create all necessary schema tables
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS birthdays (
                 user_id INTEGER PRIMARY KEY,
@@ -142,7 +142,7 @@ class UtilityBot(commands.Bot):
         """)
         await self.db.commit()
 
-        # 4. Dynamically load extensions without double-loading
+        # Dynamic cog loading with duplicate protection
         if not self._extensions_loaded:
             cogs_dir = os.path.join(os.path.dirname(__file__), "cogs")
             if os.path.exists(cogs_dir):
@@ -159,17 +159,16 @@ class UtilityBot(commands.Bot):
                                 print(f"[COG ERROR] Failed loading {cog_name}: {e}", file=sys.stderr)
             self._extensions_loaded = True
 
-        # 5. Global sync of slash commands
+        # Global slash command sync
         try:
             synced = await self.tree.sync()
             self.slash_sync_count = len(synced)
-            print(f"[SLASH] Synced {len(synced)} slash commands.")
+            print(f"[SLASH] Globally synced {len(synced)} slash commands.")
         except Exception as e:
             self.slash_sync_count = -1
             print(f"[SLASH ERROR] Slash command sync failed: {e}", file=sys.stderr)
 
     async def get_or_create_error_log_channel(self, guild: discord.Guild) -> discord.TextChannel | None:
-        """Finds or creates the designated bot-errors channel."""
         err_id = int(os.getenv("BOT_ERRORS_CHANNEL_ID", getattr(config, "BOT_ERRORS_CHANNEL_ID", 0)))
         if err_id:
             chan = guild.get_channel(err_id)
@@ -201,26 +200,23 @@ class UtilityBot(commands.Bot):
             return None
 
     async def run_diagnostic_suite(self, guild: discord.Guild) -> tuple[discord.Embed, bool]:
-        """Runs validation checks across all subsystems and outputs a status report."""
         tests = []
         overall_healthy = True
 
-        # Database Check
         try:
             start_t = time.perf_counter()
             async with self.db.execute("SELECT 1") as cursor:
                 row = await cursor.fetchone()
             db_ms = round((time.perf_counter() - start_t) * 1000, 2)
             if row and row[0] == 1:
-                tests.append(("Database Read/Write", f"✅ PASS ({db_ms}ms)"))
+                tests.append(("Database Engine", f"✅ PASS ({db_ms}ms)"))
             else:
-                tests.append(("Database Read/Write", "❌ FAIL"))
+                tests.append(("Database Engine", "❌ FAIL"))
                 overall_healthy = False
         except Exception as e:
-            tests.append(("Database Read/Write", f"❌ FAIL ({e})"))
+            tests.append(("Database Engine", f"❌ FAIL ({e})"))
             overall_healthy = False
 
-        # Cloud Backup Check
         backup_id = int(os.getenv("BACKUP_CHANNEL_ID", getattr(config, "BACKUP_CHANNEL_ID", 0)))
         if backup_id:
             b_chan = guild.get_channel(backup_id)
@@ -229,14 +225,13 @@ class UtilityBot(commands.Bot):
                 if perms.send_messages and perms.attach_files:
                     tests.append(("Cloud Backup Vault", f"✅ PASS (#{b_chan.name})"))
                 else:
-                    tests.append(("Cloud Backup Vault", "⚠️ WARN (Missing Permissions)"))
+                    tests.append(("Cloud Backup Vault", "⚠️ WARN (Missing Send/Attach permissions)"))
                     overall_healthy = False
             else:
-                tests.append(("Cloud Backup Vault", "⚠️ WARN (Invalid Channel ID)"))
+                tests.append(("Cloud Backup Vault", "⚠️ WARN (Channel not accessible)"))
         else:
-            tests.append(("Cloud Backup Vault", "⚠️ WARN (Channel Unset)"))
+            tests.append(("Cloud Backup Vault", "⚠️ WARN (BACKUP_CHANNEL_ID unset)"))
 
-        # Director Role Check
         director_name = getattr(config, "DIRECTOR_ROLE_NAME", "Director")
         director_role = discord.utils.get(guild.roles, name=director_name)
         if director_role:
@@ -244,10 +239,9 @@ class UtilityBot(commands.Bot):
         else:
             tests.append(("Authority Hierarchy", f"⚠️ WARN (@{director_name} missing)"))
 
-        # Cogs Check
         failed_cogs = [name for name, status in self.cog_load_status.items() if status != "OK"]
         if not failed_cogs:
-            tests.append(("Plugin Cog Suite", f"✅ PASS ({len(self.cog_load_status)} cogs)"))
+            tests.append(("Plugin Cog Suite", f"✅ PASS ({len(self.cog_load_status)} active)"))
         else:
             tests.append(("Plugin Cog Suite", f"❌ FAIL ({', '.join(failed_cogs)})"))
             overall_healthy = False
@@ -276,7 +270,7 @@ class UtilityBot(commands.Bot):
             restore_str = f"Error: `{self.restore_report.get('error', 'Unknown')}`"
 
         embed.add_field(name="Storage State", value=restore_str, inline=False)
-        embed.set_footer(text=f"Project-Edith • Startup Diagnostics | Status: {'ALL SYSTEMS GO' if overall_healthy else 'WARNINGS PRESENT'}")
+        embed.set_footer(text=f"Project-Edith • Startup Diagnostics | Status: {'ALL SYSTEMS GO' if overall_healthy else 'OPERATING WITH WARNINGS'}")
         return embed, overall_healthy
 
     async def on_ready(self):
@@ -286,21 +280,44 @@ class UtilityBot(commands.Bot):
         )
 
         for guild in self.guilds:
-            layout_cog = self.get_cog("LayoutRemapping")
-            if layout_cog:
-                try:
-                    await layout_cog.setup_environment(guild)
-                except Exception as e:
-                    print(f"[LAYOUT SETUP ERROR] {e}")
-
             err_channel = await self.get_or_create_error_log_channel(guild)
             if err_channel:
                 try:
                     report_embed, _ = await self.run_diagnostic_suite(guild)
                     await err_channel.send(embed=report_embed)
-                    print(f"[DIAGNOSTICS] Diagnostic audit dispatched to #{err_channel.name}")
                 except Exception as e:
                     print(f"[DIAGNOSTICS DISPATCH ERROR] {e}")
+
+    async def on_command_error(self, ctx: commands.Context, error: Exception):
+        """Catches and reports runtime command failures to chat and #bot-errors."""
+        if isinstance(error, commands.CommandNotFound):
+            return
+
+        if isinstance(error, commands.MissingPermissions):
+            await ctx.send("⛔ **Access Denied:** You do not have the required permissions.", delete_after=5)
+            return
+
+        if isinstance(error, commands.MissingRequiredArgument):
+            await ctx.send(f"❌ Missing required parameter: `{error.param.name}`. Run `.help {ctx.command}` for usage.", delete_after=6)
+            return
+
+        err_tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        print(f"[COMMAND ERROR in {ctx.command}] {err_tb}", file=sys.stderr)
+
+        err_chan = await self.get_or_create_error_log_channel(ctx.guild)
+        if err_chan:
+            embed = discord.Embed(
+                title=f"⚠️ Command Failure: `.{ctx.command}`",
+                description=f"**User:** {ctx.author.mention} (`{ctx.author.id}`)\n**Channel:** {ctx.channel.mention}\n```python\n{err_tb[:1800]}\n```",
+                color=discord.Color.red(),
+                timestamp=datetime.now(timezone.utc)
+            )
+            try:
+                await err_chan.send(embed=embed)
+            except Exception:
+                pass
+
+        await ctx.send(f"⚠️ An error occurred while executing `.{ctx.command}`. Staff has been notified.", delete_after=6)
 
     async def close(self):
         if self.db:
@@ -310,10 +327,22 @@ class UtilityBot(commands.Bot):
             except Exception:
                 pass
         await super().close()
-        await asyncio.sleep(0.5)
 
 
 bot = UtilityBot()
+
+
+@bot.command(name="sync")
+@commands.has_permissions(administrator=True)
+async def instant_sync(ctx: commands.Context):
+    """Instantly syncs slash commands directly to the current guild in 1 second."""
+    msg = await ctx.send("⏳ Registering slash commands to this guild...")
+    try:
+        bot.tree.copy_global_to(guild=ctx.guild)
+        synced = await bot.tree.sync(guild=ctx.guild)
+        await msg.edit(content=f"✅ **Synced {len(synced)} slash commands instantly!** You can now use `/` commands immediately.")
+    except Exception as e:
+        await msg.edit(content=f"❌ Sync failed: `{e}`")
 
 
 async def main():
