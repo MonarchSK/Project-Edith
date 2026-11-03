@@ -6,24 +6,17 @@ from datetime import datetime, timezone
 import config
 
 MAX_PURGE_LIMIT = 100
-CONFIRMATION_DELETE_DELAY = 5  # Seconds before the confirmation message self-destructs
+CONFIRMATION_DELETE_DELAY = 5
 
 
 def is_purge_authorized(member: discord.Member) -> bool:
-    """Verifies if the user is an Administrator, Director, or authorized staff."""
     if not isinstance(member, discord.Member):
         return False
-
-    # 1. Native Discord Permissions
     if member.guild_permissions.administrator or member.guild_permissions.manage_messages:
         return True
-
-    # 2. Configured Director Role
     director_role_name = getattr(config, "DIRECTOR_ROLE_NAME", "Director")
     if any(r.name.lower() == director_role_name.lower() for r in member.roles):
         return True
-
-    # 3. Explicit Authority Role Names
     allowed_role_names = {"authority", "admin", "administrator", "director", "moderator", "head mod"}
     return any(r.name.lower() in allowed_role_names for r in member.roles)
 
@@ -39,7 +32,6 @@ class Moderation(commands.Cog):
         amount: int,
         target_member: discord.Member = None
     ) -> int:
-        """Core purge execution engine with optional member filter."""
         def check_filter(msg: discord.Message) -> bool:
             if target_member:
                 return msg.author.id == target_member.id
@@ -48,10 +40,8 @@ class Moderation(commands.Cog):
         deleted_messages = await channel.purge(limit=amount, check=check_filter, bulk=True)
         return len(deleted_messages)
 
-    # --- Prefix Command: .purge <amount> [@user] ---
     @commands.command(name="purge", aliases=["clear", "clean"])
     async def prefix_purge(self, ctx: commands.Context, amount: int, member: discord.Member = None):
-        """Purge messages: .purge 20 or .purge 20 @user"""
         if not is_purge_authorized(ctx.author):
             embed = discord.Embed(
                 title="⛔ Access Denied",
@@ -77,7 +67,6 @@ class Moderation(commands.Cog):
                 pass
             return
 
-        # Delete the trigger command message immediately
         try:
             await ctx.message.delete()
         except Exception:
@@ -103,7 +92,6 @@ class Moderation(commands.Cog):
         embed.add_field(name="Authorized Operative", value=ctx.author.mention, inline=True)
         embed.set_footer(text=f"Purged from #{ctx.channel.name}")
 
-        # Post disappearing confirmation in channel
         confirm_msg = await ctx.send(embed=embed)
         await asyncio.sleep(CONFIRMATION_DELETE_DELAY)
         try:
@@ -111,7 +99,6 @@ class Moderation(commands.Cog):
         except Exception:
             pass
 
-    # --- Slash Command: /purge <amount> [member] ---
     @app_commands.command(name="purge", description="Purge messages from the current channel (Authority only).")
     @app_commands.describe(
         amount="Number of messages to delete (1-100)",
@@ -132,7 +119,6 @@ class Moderation(commands.Cog):
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        # Immediate deferral to prevent 404 Unknown Interaction
         await interaction.response.defer(ephemeral=True)
 
         deleted_count = await self.execute_purge(
@@ -146,7 +132,6 @@ class Moderation(commands.Cog):
         if member:
             desc = f"🧹 Purged **{deleted_count}** messages authored by {member.mention}."
 
-        # 1. Ephemeral notification to moderator
         embed_ephemeral = discord.Embed(
             title="⚡ Channel Purge Complete",
             description=desc,
@@ -157,7 +142,6 @@ class Moderation(commands.Cog):
         embed_ephemeral.set_footer(text="Project-Edith • Moderation Gateway")
         await interaction.followup.send(embed=embed_ephemeral, ephemeral=True)
 
-        # 2. Public auto-disappearing notice in the purged channel
         embed_public = discord.Embed(
             title="🧹 Messages Purged",
             description=f"{desc}\n\n⏳ *This message will self-destruct in **{CONFIRMATION_DELETE_DELAY}** seconds.*",
