@@ -20,7 +20,7 @@ intents.voice_states = True
 class UtilityBot(commands.Bot):
     def __init__(self):
         super().__init__(
-            command_prefix=".",
+            command_prefix=commands.when_mentioned_or(".", ";"),
             intents=intents,
             help_command=None
         )
@@ -39,6 +39,7 @@ class UtilityBot(commands.Bot):
         }
 
     async def restore_database_from_discord(self):
+        """Scans the backup channel for the latest .db snapshot before database initialization."""
         backup_id = int(os.getenv("BACKUP_CHANNEL_ID", getattr(config, "BACKUP_CHANNEL_ID", 0)))
         if not backup_id or backup_id == 0:
             print("[RESTORE] BACKUP_CHANNEL_ID is unset. Starting clean local database.")
@@ -73,13 +74,16 @@ class UtilityBot(commands.Bot):
         self.restore_report["is_fresh"] = True
 
     async def setup_hook(self):
+        # 1. Download snapshot from Discord channel
         await self.restore_database_from_discord()
+
+        # 2. Establish SQLite connection
         self.db = await aiosqlite.connect(DB_PATH)
 
-        # Enable WAL mode to avoid database locks during live snapshots
+        # 3. Enable WAL mode to avoid database locks during live snapshots
         await self.db.execute("PRAGMA journal_mode=WAL;")
 
-        # Create all necessary schema tables
+        # 4. Create all necessary schema tables
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS birthdays (
                 user_id INTEGER PRIMARY KEY,
@@ -142,7 +146,7 @@ class UtilityBot(commands.Bot):
         """)
         await self.db.commit()
 
-        # Dynamic cog loading with duplicate protection
+        # 5. Dynamic cog loading with duplicate protection
         if not self._extensions_loaded:
             cogs_dir = os.path.join(os.path.dirname(__file__), "cogs")
             if os.path.exists(cogs_dir):
@@ -159,7 +163,7 @@ class UtilityBot(commands.Bot):
                                 print(f"[COG ERROR] Failed loading {cog_name}: {e}", file=sys.stderr)
             self._extensions_loaded = True
 
-        # Global slash command sync
+        # 6. Global slash command sync
         try:
             synced = await self.tree.sync()
             self.slash_sync_count = len(synced)
@@ -332,6 +336,7 @@ class UtilityBot(commands.Bot):
 bot = UtilityBot()
 
 
+# --- Command: .sync / ;sync (Forces instant registration of slash commands) ---
 @bot.command(name="sync")
 @commands.has_permissions(administrator=True)
 async def instant_sync(ctx: commands.Context):
@@ -343,6 +348,64 @@ async def instant_sync(ctx: commands.Context):
         await msg.edit(content=f"✅ **Synced {len(synced)} slash commands instantly!** You can now use `/` commands immediately.")
     except Exception as e:
         await msg.edit(content=f"❌ Sync failed: `{e}`")
+
+
+# --- Command: .list / ;list / .help ---
+@bot.command(name="list", aliases=["commands", "help"])
+async def list_commands(ctx: commands.Context):
+    """Displays a directory of all available server commands."""
+    embed = discord.Embed(
+        title="🤖 Project-Edith // Command Matrix",
+        description=(
+            "Accepted Prefixes: `.` or `;` | Slash Commands: `/`\n"
+            "Below is the complete roster of operative and administrative tools."
+        ),
+        color=discord.Color.from_rgb(0, 168, 252),
+        timestamp=datetime.now(timezone.utc)
+    )
+    if ctx.guild.icon:
+        embed.set_thumbnail(url=ctx.guild.icon.url)
+
+    embed.add_field(
+        name="🎮 Engagement & Community",
+        value=(
+            "• `;rank [@user]` — Check level, messages, voice time & progress\n"
+            "• `;bump` — Boost server rank & earn **+200 XP** (2h cooldown)\n"
+            "• `;list` — Display this command directory"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🛡️ Moderation & Enforcement (Staff)",
+        value=(
+            "• `;warn @user [reason]` — Issue an infraction notice\n"
+            "• `;warnings [@user]` — View infraction history\n"
+            "• `;clearwarns @user` — Wipe user warnings *(Admin only)*\n"
+            "• `;mute @user [time] [reason]` — Timeout member (e.g. `10m`, `2h`)\n"
+            "• `;unmute @user` — Lift active timeout\n"
+            "• `;kick @user [reason]` — Eject member from server\n"
+            "• `;ban @user [reason]` — Permanently ban member\n"
+            "• `;unban <id> [reason]` — Revoke ban by User ID\n"
+            "• `;purge <1-100> [@user]` — Clean chat messages with auto-destruct confirmation"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="⚡ Broadcast & Control (Director/Admin)",
+        value=(
+            "• `;announce [#channel]` — Launch announcement draft studio\n"
+            "• `;welcome [#channel]` — Deploy the long-form welcome guide\n"
+            "• `;revive [topic]` — Ping Revive Pings role to wake up chat\n"
+            "• `;backup` — Force manual SQLite snapshot to `#bot-memory`\n"
+            "• `;sync` — Instantly sync slash commands to current server"
+        ),
+        inline=False
+    )
+
+    embed.set_footer(text=f"Requested by {ctx.author.display_name} • Project-Edith")
+    await ctx.send(embed=embed)
 
 
 async def main():
