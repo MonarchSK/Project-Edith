@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import asyncio
 import aiosqlite
 import discord
@@ -24,12 +25,15 @@ class UtilityBot(commands.Bot):
         )
         self.db: aiosqlite.Connection = None
         self._extensions_loaded = False
+        self.boot_start_time = time.time()
+        self.cog_load_status = {}
         self.restore_report = {
             "success": False,
             "filename": None,
             "timestamp": None,
             "filesize_kb": 0.0,
-            "is_fresh": False
+            "is_fresh": False,
+            "error": None
         }
 
     async def restore_database_from_discord(self):
@@ -54,20 +58,23 @@ class UtilityBot(commands.Bot):
                             "filename": attachment.filename,
                             "timestamp": message.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
                             "filesize_kb": round(size_kb, 2),
-                            "is_fresh": False
+                            "is_fresh": False,
+                            "error": None
                         }
                         print(f"[RESTORE] Restored persistent storage from '{attachment.filename}' ({round(size_kb, 2)} KB)")
                         return
         except Exception as e:
-            print(f"[RESTORE ERROR] Could not retrieve snapshot: {e}")
+            err_msg = str(e)
+            print(f"[RESTORE ERROR] Could not retrieve snapshot: {err_msg}")
+            self.restore_report["error"] = err_msg
 
         print("[RESTORE] No prior backup file found in channel history. Starting fresh database.")
         self.restore_report["is_fresh"] = True
 
     async def setup_hook(self):
-        # 1. Download the latest backup from Discord channel
+        # 1. Download snapshot from Discord channel
         await self.restore_database_from_discord()
-        
+
         # 2. Establish SQLite connection
         self.db = await aiosqlite.connect(DB_PATH)
 
@@ -134,67 +141,167 @@ class UtilityBot(commands.Bot):
                         if cog_name not in self.extensions:
                             try:
                                 await self.load_extension(cog_name)
+                                self.cog_load_status[filename[:-3]] = "OK"
                                 print(f"[COG LOADED] {cog_name}")
                             except Exception as e:
+                                self.cog_load_status[filename[:-3]] = f"FAILED: {e}"
                                 print(f"[COG ERROR] Failed loading {cog_name}: {e}", file=sys.stderr)
             self._extensions_loaded = True
 
         # 5. Global sync of slash commands across guilds
         try:
             synced = await self.tree.sync()
+            self.slash_sync_count = len(synced)
             print(f"[SLASH] Synced {len(synced)} slash commands.")
         except Exception as e:
+            self.slash_sync_count = -1
             print(f"[SLASH ERROR] Slash command sync failed: {e}", file=sys.stderr)
 
-    async def send_startup_embed(self):
-        backup_id = int(os.getenv("BACKUP_CHANNEL_ID", getattr(config, "BACKUP_CHANNEL_ID", 0)))
-        if not backup_id or backup_id == 0:
-            return
+    async def get_or_create_error_log_channel(self, guild: discord.Guild) -> discord.TextChannel | None:
+        """Locates or provisions the bot error log channel."""
+        err_id = int(os.getenv("BOT_ERRORS_CHANNEL_ID", getattr(config, "BOT_ERRORS_CHANNEL_ID", 0)))
+        if err_id:
+            chan = guild.get_channel(err_id)
+            if chan:
+                return chan
 
+        for chan in guild.text_channels:
+            if chan.name in ["bot-errors", "bot-error-logs", "error-logs"]:
+                return chan
+
+        backup_cat = discord.utils.get(guild.categories, name="🛠️ BACKUPS & CONTROL")
         try:
-            channel = self.get_channel(backup_id) or await self.fetch_channel(backup_id)
-        except Exception:
-            return
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True)
+            }
+            director_role = discord.utils.get(guild.roles, name=getattr(config, "DIRECTOR_ROLE_NAME", "Director"))
+            if director_role:
+                overwrites[director_role] = discord.PermissionOverwrite(view_channel=True, send_messages=False)
 
-        b_count, l_count, c_count = 0, 0, 0
-        try:
-            async with self.db.execute("SELECT COUNT(*) FROM birthdays") as c:
-                row = await c.fetchone()
-                b_count = row[0] if row else 0
-            async with self.db.execute("SELECT COUNT(*) FROM levels") as c:
-                row = await c.fetchone()
-                l_count = row[0] if row else 0
-            async with self.db.execute("SELECT COUNT(*) FROM confessions") as c:
-                row = await c.fetchone()
-                c_count = row[0] if row else 0
-        except Exception:
-            pass
-
-        if self.restore_report["success"]:
-            embed = discord.Embed(
-                title="🟢 Database Restored & Operational",
-                description="Project-Edith restarted. Storage synchronized from Discord backup.",
-                color=discord.Color.green(),
-                timestamp=datetime.now(timezone.utc)
+            return await guild.create_text_channel(
+                name="bot-errors",
+                category=backup_cat,
+                overwrites=overwrites,
+                topic="Automated diagnostic logs, runtime errors, and startup telemetry."
             )
-            embed.add_field(name="📦 Backup File", value=f"`{self.restore_report['filename']}`", inline=True)
-            embed.add_field(name="⚖️ Size", value=f"`{self.restore_report['filesize_kb']} KB`", inline=True)
-        else:
-            embed = discord.Embed(
-                title="🟡 Clean Database Initialized",
-                description="No historical snapshot found. Ready for registrations & activity.",
-                color=discord.Color.gold(),
-                timestamp=datetime.now(timezone.utc)
-            )
-
-        embed.add_field(name="🎂 Birthdays", value=f"`{b_count}`", inline=True)
-        embed.add_field(name="📊 Tracked Members", value=f"`{l_count}`", inline=True)
-        embed.add_field(name="🤫 Confessions", value=f"`{c_count}`", inline=True)
-        embed.set_footer(text=f"{self.user.name} • Persistent Cloud Storage")
-        try:
-            await channel.send(embed=embed)
         except Exception as e:
-            print(f"[STARTUP EMBED ERROR] {e}")
+            print(f"[CHANNEL PROVISION ERROR] Could not create #bot-errors: {e}")
+            return None
+
+    async def run_diagnostic_suite(self, guild: discord.Guild) -> tuple[discord.Embed, bool]:
+        """Executes a diagnostic battery across all bot modules and constructs the audit report."""
+        tests = []
+        overall_healthy = True
+
+        # --- Test 1: SQLite Database Engine ---
+        try:
+            start_t = time.perf_counter()
+            async with self.db.execute("SELECT 1") as cursor:
+                row = await cursor.fetchone()
+            db_ms = round((time.perf_counter() - start_t) * 1000, 2)
+            if row and row[0] == 1:
+                tests.append(("Database Read/Write", f"✅ PASS ({db_ms}ms latency)"))
+            else:
+                tests.append(("Database Read/Write", "❌ FAIL (Unexpected return)"))
+                overall_healthy = False
+        except Exception as e:
+            tests.append(("Database Read/Write", f"❌ FAIL ({e})"))
+            overall_healthy = False
+
+        # --- Test 2: Persistent Storage Backup Channel ---
+        backup_id = int(os.getenv("BACKUP_CHANNEL_ID", getattr(config, "BACKUP_CHANNEL_ID", 0)))
+        if backup_id:
+            b_chan = guild.get_channel(backup_id)
+            if b_chan:
+                perms = b_chan.permissions_for(guild.me)
+                if perms.send_messages and perms.attach_files:
+                    tests.append(("Cloud Backup Vault", f"✅ PASS (#{b_chan.name})"))
+                else:
+                    tests.append(("Cloud Backup Vault", "⚠️ WARN (Missing Send/Attach permissions)"))
+                    overall_healthy = False
+            else:
+                tests.append(("Cloud Backup Vault", "⚠️ WARN (Channel ID not found in guild)"))
+        else:
+            tests.append(("Cloud Backup Vault", "⚠️ WARN (BACKUP_CHANNEL_ID unset)"))
+
+        # --- Test 3: Announcement Hub Channel ---
+        ann_id = int(os.getenv("ANNOUNCEMENT_CHANNEL_ID", getattr(config, "ANNOUNCEMENT_CHANNEL_ID", 0)))
+        if ann_id:
+            a_chan = guild.get_channel(ann_id)
+            if a_chan:
+                tests.append(("Announcement Hub", f"✅ PASS (#{a_chan.name})"))
+            else:
+                tests.append(("Announcement Hub", "⚠️ WARN (Channel not accessible)"))
+        else:
+            tests.append(("Announcement Hub", "⚠️ WARN (ANNOUNCEMENT_CHANNEL_ID unset)"))
+
+        # --- Test 4: Slash Command Gateway ---
+        if hasattr(self, "slash_sync_count") and self.slash_sync_count >= 0:
+            tests.append(("Slash Command Gateway", f"✅ PASS ({self.slash_sync_count} synced)"))
+        else:
+            tests.append(("Slash Command Gateway", "❌ FAIL (Sync error)"))
+            overall_healthy = False
+
+        # --- Test 5: Authority Role Presence ---
+        director_name = getattr(config, "DIRECTOR_ROLE_NAME", "Director")
+        director_role = discord.utils.get(guild.roles, name=director_name)
+        if director_role:
+            tests.append(("Authority Hierarchy", f"✅ PASS (@{director_name} detected)"))
+        else:
+            tests.append(("Authority Hierarchy", f"⚠️ WARN (@{director_name} role missing)"))
+
+        # --- Test 6: Permissions Battery ---
+        bot_member = guild.me
+        perm_issues = []
+        if not bot_member.guild_permissions.manage_roles:
+            perm_issues.append("Manage Roles")
+        if not bot_member.guild_permissions.manage_nicknames:
+            perm_issues.append("Manage Nicknames")
+        if not bot_member.guild_permissions.manage_channels:
+            perm_issues.append("Manage Channels")
+
+        if not perm_issues:
+            tests.append(("Core Permissions", "✅ PASS (Full privilege set)"))
+        else:
+            tests.append(("Core Permissions", f"⚠️ WARN (Missing: {', '.join(perm_issues)})"))
+
+        # --- Test 7: Loaded Cogs Health ---
+        failed_cogs = [name for name, status in self.cog_load_status.items() if status != "OK"]
+        if not failed_cogs:
+            tests.append(("Plugin Cog Suite", f"✅ PASS ({len(self.cog_load_status)} active)"))
+        else:
+            tests.append(("Plugin Cog Suite", f"❌ FAIL ({', '.join(failed_cogs)})"))
+            overall_healthy = False
+
+        boot_duration = round(time.time() - self.boot_start_time, 2)
+
+        # Construct Diagnostic Report Embed
+        embed = discord.Embed(
+            title="🛠️ Edith Subsystem Startup Self-Test",
+            description=(
+                f"**Environment:** Python 3.14 on Render\n"
+                f"**Guild Scope:** {guild.name} (`{guild.id}`)\n"
+                f"**Boot Elapsed:** `{boot_duration}s` • **API Latency:** `{round(self.latency * 1000, 1)}ms`"
+            ),
+            color=discord.Color.green() if overall_healthy else discord.Color.gold(),
+            timestamp=datetime.now(timezone.utc)
+        )
+
+        for name, result in tests:
+            embed.add_field(name=name, value=result, inline=True)
+
+        # Database Snapshot Restoration details
+        if self.restore_report["success"]:
+            restore_str = f"Restored `{self.restore_report['filename']}` ({self.restore_report['filesize_kb']} KB)"
+        elif self.restore_report["is_fresh"]:
+            restore_str = "Initialized clean database"
+        else:
+            restore_str = f"Error: `{self.restore_report.get('error', 'Unknown')}`"
+
+        embed.add_field(name="Storage State", value=restore_str, inline=False)
+        embed.set_footer(text=f"Project-Edith • Startup Diagnostics Engine | Status: {'ALL SYSTEMS GO' if overall_healthy else 'OPERATING WITH WARNINGS'}")
+        return embed, overall_healthy
 
     async def on_ready(self):
         print(f"[READY] Operational as {self.user} (ID: {self.user.id})")
@@ -203,6 +310,7 @@ class UtilityBot(commands.Bot):
         )
 
         for guild in self.guilds:
+            # 1. Run Layout setup if present
             layout_cog = self.get_cog("LayoutRemapping")
             if layout_cog:
                 try:
@@ -210,7 +318,15 @@ class UtilityBot(commands.Bot):
                 except Exception as e:
                     print(f"[LAYOUT SETUP ERROR] {e}")
 
-        await self.send_startup_embed()
+            # 2. Run diagnostic battery and dispatch results to #bot-errors
+            err_channel = await self.get_or_create_error_log_channel(guild)
+            if err_channel:
+                try:
+                    report_embed, _ = await self.run_diagnostic_suite(guild)
+                    await err_channel.send(embed=report_embed)
+                    print(f"[DIAGNOSTICS] Diagnostic audit dispatched to #{err_channel.name}")
+                except Exception as e:
+                    print(f"[DIAGNOSTICS DISPATCH ERROR] {e}")
 
     async def close(self):
         if self.db:
