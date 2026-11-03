@@ -8,7 +8,7 @@ import config
 
 DB_PATH = "bot_database.db"
 KEEP_BACKUP_COUNT = 3
-MIN_INTERVAL_BETWEEN_SNAPSHOTS = 600  # Minimum 10 minutes between automated syncs to prevent rate limits
+MIN_INTERVAL_BETWEEN_SNAPSHOTS = 600
 
 
 class DiscordMemoryBackup(commands.Cog):
@@ -52,26 +52,21 @@ class DiscordMemoryBackup(commands.Cog):
                 if msg.author == self.bot.user and any(a.filename.endswith(".db") for a in msg.attachments):
                     valid_backups.append(msg)
 
-            # Sort strictly newest first
             valid_backups.sort(key=lambda m: m.created_at, reverse=True)
-
-            # Keep top 3, delete all remaining
             to_delete = valid_backups[KEEP_BACKUP_COUNT:]
             for stale_msg in to_delete:
                 try:
                     await stale_msg.delete()
-                    await asyncio.sleep(0.5)  # Mild pacing to respect Discord rate limits
+                    await asyncio.sleep(0.5)
                 except discord.NotFound:
                     pass
                 except Exception as e:
                     print(f"[BACKUP PRUNE ERROR] Failed deleting message {stale_msg.id}: {e}")
-
-            print(f"[BACKUP PRUNE] Retained {min(len(valid_backups), KEEP_BACKUP_COUNT)} snapshots. Deleted {len(to_delete)} stale backups.")
         except Exception as e:
             print(f"[BACKUP PRUNE ERROR] {e}")
 
     async def upload_backup_and_prune(self, reason: str = "Routine Sync"):
-        """Thread-safe snapshot export to #bot-memory with instant pruning of backups older than the last 3."""
+        """Thread-safe snapshot export to #bot-memory with instant pruning of backups older than 3."""
         async with self.backup_lock:
             backup_id = int(os.getenv("BACKUP_CHANNEL_ID", getattr(config, "BACKUP_CHANNEL_ID", 0)))
             if not backup_id:
@@ -93,7 +88,7 @@ class DiscordMemoryBackup(commands.Cog):
                 discord_file = discord.File(temp_file, filename=filename)
 
                 # Fetch database stats for telemetry embed
-                b_count, l_count, c_count = 0, 0, 0
+                b_count, l_count, c_count, bump_info = 0, 0, 0, "None"
                 try:
                     async with self.bot.db.execute("SELECT COUNT(*) FROM birthdays") as cur:
                         b_count = (await cur.fetchone())[0]
@@ -101,6 +96,10 @@ class DiscordMemoryBackup(commands.Cog):
                         l_count = (await cur.fetchone())[0]
                     async with self.bot.db.execute("SELECT COUNT(*) FROM confessions") as cur:
                         c_count = (await cur.fetchone())[0]
+                    async with self.bot.db.execute("SELECT last_bump_timestamp FROM bump_status LIMIT 1") as cur:
+                        row = await cur.fetchone()
+                        if row and row[0]:
+                            bump_info = f"<t:{row[0]}:R>"
                 except Exception:
                     pass
 
@@ -110,7 +109,8 @@ class DiscordMemoryBackup(commands.Cog):
                     timestamp=now_utc
                 )
                 embed.add_field(name="Trigger Reason", value=f"`{reason}`", inline=True)
-                embed.add_field(name="Retained Limit", value=f"`Last {KEEP_BACKUP_COUNT} Snapshots`", inline=True)
+                embed.add_field(name="Retained Limit", value=f"`Last {KEEP_BACKUP_COUNT} Files`", inline=True)
+                embed.add_field(name="Last Bump Recorded", value=bump_info, inline=True)
                 embed.add_field(name="Birthdays", value=f"`{b_count}`", inline=True)
                 embed.add_field(name="Tracked Members", value=f"`{l_count}`", inline=True)
                 embed.add_field(name="Confessions", value=f"`{c_count}`", inline=True)
@@ -128,20 +128,17 @@ class DiscordMemoryBackup(commands.Cog):
                 print(f"[BACKUP UPLOAD ERROR] {e}")
                 return
 
-            # Run automatic pruning immediately after successful upload
             await self.prune_stale_backups(channel)
 
     def mark_dirty(self, reason: str = "Database Mutation"):
-        """Marks database as modified for batch flushing."""
         self.is_dirty = True
 
     async def _debounced_backup_worker(self):
-        """Monitors dirty flag and flushes every 10 minutes without blocking the bot."""
         while not self.bot.is_closed():
             await asyncio.sleep(60)
             now = datetime.now(timezone.utc).timestamp()
             if self.is_dirty and (now - self.last_backup_time >= MIN_INTERVAL_BETWEEN_SNAPSHOTS):
-                await self.upload_backup_and_prune(reason="Batch XP/Activity Sync")
+                await self.upload_backup_and_prune(reason="Batch Activity Sync")
 
     @tasks.loop(hours=1)
     async def hourly_backup(self):
@@ -155,7 +152,7 @@ class DiscordMemoryBackup(commands.Cog):
     @commands.command(name="backup")
     @commands.has_permissions(administrator=True)
     async def manual_backup_cmd(self, ctx: commands.Context):
-        """Manually create a backup and prune older files: .backup"""
+        """Manually trigger persistent backup: .backup"""
         msg = await ctx.send("⏳ Generating snapshot and dispatching to `#bot-memory`...")
         await self.upload_backup_and_prune(reason=f"Manual execution by {ctx.author.name}")
         await msg.edit(content=f"✅ Database snapshot stored and older backups pruned (retaining last {KEEP_BACKUP_COUNT}).")
