@@ -112,8 +112,12 @@ class Welcome(commands.Cog):
         if guild.icon:
             embed.set_thumbnail(url=guild.icon.url)
 
-        # Use configured banner or fallback
-        banner_url = getattr(config, "COLOR_BANNER", None) or getattr(config, "TICKET_BANNER", None)
+        # 1. Use dedicated WELCOME_BANNER, falling back to COLOR_BANNER or TICKET_BANNER
+        banner_url = (
+            getattr(config, "WELCOME_BANNER", None)
+            or getattr(config, "COLOR_BANNER", None)
+            or getattr(config, "TICKET_BANNER", None)
+        )
         if banner_url:
             embed.set_image(url=banner_url)
 
@@ -173,7 +177,6 @@ class Welcome(commands.Cog):
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        # Defer immediately to prevent 10062 timeouts on Render
         await interaction.response.defer(ephemeral=True)
 
         target_channel = channel or interaction.channel
