@@ -45,7 +45,6 @@ class DiscordMemoryBackup(commands.Cog):
         return temp
 
     async def prune_stale_backups(self, channel: discord.TextChannel):
-        """Scans channel history and deletes all backups except the 3 newest."""
         try:
             valid_backups = []
             async for msg in channel.history(limit=50):
@@ -66,7 +65,6 @@ class DiscordMemoryBackup(commands.Cog):
             print(f"[BACKUP PRUNE ERROR] {e}")
 
     async def upload_backup_and_prune(self, reason: str = "Routine Sync"):
-        """Thread-safe snapshot export to #bot-memory with instant pruning of backups older than 3."""
         async with self.backup_lock:
             backup_id = int(os.getenv("BACKUP_CHANNEL_ID", getattr(config, "BACKUP_CHANNEL_ID", 0)))
             if not backup_id:
@@ -87,7 +85,6 @@ class DiscordMemoryBackup(commands.Cog):
                 filename = f"backup_{now_utc.strftime('%Y%m%d_%H%M%S')}.db"
                 discord_file = discord.File(temp_file, filename=filename)
 
-                # Fetch database stats for telemetry embed
                 b_count, l_count, c_count, bump_info = 0, 0, 0, "None"
                 try:
                     async with self.bot.db.execute("SELECT COUNT(*) FROM birthdays") as cur:
@@ -123,7 +120,6 @@ class DiscordMemoryBackup(commands.Cog):
 
                 self.last_backup_time = now_utc.timestamp()
                 self.is_dirty = False
-
             except Exception as e:
                 print(f"[BACKUP UPLOAD ERROR] {e}")
                 return
@@ -152,7 +148,6 @@ class DiscordMemoryBackup(commands.Cog):
     @commands.command(name="backup")
     @commands.has_permissions(administrator=True)
     async def manual_backup_cmd(self, ctx: commands.Context):
-        """Manually trigger persistent backup: .backup"""
         msg = await ctx.send("⏳ Generating snapshot and dispatching to `#bot-memory`...")
         await self.upload_backup_and_prune(reason=f"Manual execution by {ctx.author.name}")
         await msg.edit(content=f"✅ Database snapshot stored and older backups pruned (retaining last {KEEP_BACKUP_COUNT}).")
