@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import config
 
 MAX_PURGE_LIMIT = 100
-CONFIRMATION_DELETE_DELAY = 5
+CONFIRMATION_DELETE_DELAY = 5  # Seconds before the confirmation message self-destructs
 
 
 def is_purge_authorized(member: discord.Member) -> bool:
@@ -45,7 +45,6 @@ class Moderation(commands.Cog):
                 return msg.author.id == target_member.id
             return True
 
-        # purge messages (Discord API handles 14-day limit automatically with bulk=True)
         deleted_messages = await channel.purge(limit=amount, check=check_filter, bulk=True)
         return len(deleted_messages)
 
@@ -56,7 +55,7 @@ class Moderation(commands.Cog):
         if not is_purge_authorized(ctx.author):
             embed = discord.Embed(
                 title="⛔ Access Denied",
-                description="This protocol is restricted to **Administrators**, **Directors**, and **Authorized Staff**.",
+                description="This protocol is restricted to **Administrators**, **Directors**, and **Authorized Staff**.\n\n⏳ *Notice disappearing in 4 seconds.*",
                 color=discord.Color.red()
             )
             msg = await ctx.send(embed=embed)
@@ -69,14 +68,16 @@ class Moderation(commands.Cog):
             return
 
         if not (1 <= amount <= MAX_PURGE_LIMIT):
-            await ctx.send(f"❌ Please enter an amount between `1` and `{MAX_PURGE_LIMIT}`.", delete_after=4)
+            err_msg = await ctx.send(f"❌ Please enter an amount between `1` and `{MAX_PURGE_LIMIT}`.\n⏳ *Disappearing in 4 seconds.*")
+            await asyncio.sleep(4)
             try:
+                await err_msg.delete()
                 await ctx.message.delete()
             except Exception:
                 pass
             return
 
-        # Delete command invoker message first so it does not skew the count
+        # Delete the trigger command message immediately
         try:
             await ctx.message.delete()
         except Exception:
@@ -95,13 +96,14 @@ class Moderation(commands.Cog):
 
         embed = discord.Embed(
             title="⚡ Channel Purge Executed",
-            description=desc,
+            description=f"{desc}\n\n⏳ *This notice will self-destruct in **{CONFIRMATION_DELETE_DELAY}** seconds.*",
             color=discord.Color.teal(),
             timestamp=datetime.now(timezone.utc)
         )
         embed.add_field(name="Authorized Operative", value=ctx.author.mention, inline=True)
-        embed.set_footer(text=f"Purged from #{ctx.channel.name} • Auto-clearing in {CONFIRMATION_DELETE_DELAY}s")
+        embed.set_footer(text=f"Purged from #{ctx.channel.name}")
 
+        # Post disappearing confirmation in channel
         confirm_msg = await ctx.send(embed=embed)
         await asyncio.sleep(CONFIRMATION_DELETE_DELAY)
         try:
@@ -144,16 +146,31 @@ class Moderation(commands.Cog):
         if member:
             desc = f"🧹 Purged **{deleted_count}** messages authored by {member.mention}."
 
-        embed = discord.Embed(
+        # 1. Ephemeral notification to moderator
+        embed_ephemeral = discord.Embed(
             title="⚡ Channel Purge Complete",
             description=desc,
             color=discord.Color.teal(),
             timestamp=datetime.now(timezone.utc)
         )
-        embed.add_field(name="Authorized By", value=interaction.user.mention, inline=True)
-        embed.set_footer(text="Project-Edith • Moderation Gateway")
+        embed_ephemeral.add_field(name="Authorized By", value=interaction.user.mention, inline=True)
+        embed_ephemeral.set_footer(text="Project-Edith • Moderation Gateway")
+        await interaction.followup.send(embed=embed_ephemeral, ephemeral=True)
 
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        # 2. Public auto-disappearing notice in the purged channel
+        embed_public = discord.Embed(
+            title="🧹 Messages Purged",
+            description=f"{desc}\n\n⏳ *This message will self-destruct in **{CONFIRMATION_DELETE_DELAY}** seconds.*",
+            color=discord.Color.dark_teal()
+        )
+        embed_public.set_footer(text=f"Authorized by {interaction.user.display_name}")
+
+        try:
+            public_msg = await interaction.channel.send(embed=embed_public)
+            await asyncio.sleep(CONFIRMATION_DELETE_DELAY)
+            await public_msg.delete()
+        except Exception:
+            pass
 
 
 async def setup(bot):
