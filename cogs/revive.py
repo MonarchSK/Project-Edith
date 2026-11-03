@@ -7,8 +7,8 @@ from discord.ext import commands
 from datetime import datetime, timezone
 import config
 
-REVIVE_COOLDOWN_SECONDS = 7200  # 2 Hours cooldown between revives
-REVIVE_ROLE_NAME = "Revive Pings"
+REVIVE_COOLDOWN_SECONDS = 7200
+REVIVE_ROLE_NAME = getattr(config, "REVIVE_ROLE_NAME", "Revive Pings")
 
 ENGAGING_CONVERSATION_TOPICS = [
     "What game or show has everyone been hooked on recently?",
@@ -22,20 +22,16 @@ ENGAGING_CONVERSATION_TOPICS = [
 
 
 def is_revive_authorized(member: discord.Member) -> bool:
-    """Verifies that the user holds Admin, Director, or explicit Authority status."""
     if not isinstance(member, discord.Member):
         return False
-
     if member.guild_permissions.administrator:
         return True
-
     director_role = getattr(config, "DIRECTOR_ROLE_NAME", "Director").lower()
     allowed_roles = {director_role, "authority", "admin", "administrator", "head mod"}
     return any(r.name.lower() in allowed_roles for r in member.roles)
 
 
 async def get_or_create_revive_role(guild: discord.Guild) -> discord.Role | None:
-    """Finds or creates a dedicated opt-in role for members who want revive alerts."""
     role = discord.utils.get(guild.roles, name=REVIVE_ROLE_NAME)
     if not role:
         try:
@@ -50,7 +46,6 @@ async def get_or_create_revive_role(guild: discord.Guild) -> discord.Role | None
     return role
 
 
-# --- Persistent Opt-In Role Toggle View ---
 class ReviveRoleToggleView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -93,7 +88,6 @@ class Revive(commands.Cog):
         self.bot.add_view(ReviveRoleToggleView())
 
     async def get_cooldown_status(self, guild_id: int) -> tuple[bool, int, str]:
-        """Checks SQLite database to enforce persistent cooldown across restarts."""
         now = int(time.time())
         try:
             async with self.bot.db.execute(
@@ -154,9 +148,8 @@ class Revive(commands.Cog):
         embed.set_footer(text="Project-Edith • Server Pulse | Next revive in 2 hours")
         return embed
 
-    # --- Slash Command: /revive [topic] ---
     @app_commands.command(name="revive", description="Alert opt-in revive members to awaken chat discussions (Authority only).")
-    @app_commands.describe(topic="Optional custom question or topic to start the discussion")
+    @app_commands.describe(topic="Optional custom question or topic to start discussion")
     async def slash_revive(self, interaction: discord.Interaction, topic: str = None):
         if not is_revive_authorized(interaction.user):
             embed = discord.Embed(
@@ -196,13 +189,11 @@ class Revive(commands.Cog):
                 allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False)
             )
             await interaction.followup.send("✅ Chat revive broadcast dispatched successfully.", ephemeral=True)
-        except discord.Forbidden:
+        except Exception:
             await interaction.followup.send("❌ Discord blocked the broadcast. Verify Edith's permissions to mention roles.", ephemeral=True)
 
-    # --- Prefix Command: .revive [topic] ---
     @commands.command(name="revive", aliases=["chatrevive", "wake"])
     async def prefix_revive(self, ctx: commands.Context, *, topic: str = None):
-        """Broadcast chat revival to Revive Pings role: .revive or .revive What is everyone playing?"""
         if not is_revive_authorized(ctx.author):
             try:
                 await ctx.message.delete()
