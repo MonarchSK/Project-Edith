@@ -10,14 +10,24 @@ import config
 REVIVE_COOLDOWN_SECONDS = 7200
 REVIVE_ROLE_NAME = getattr(config, "REVIVE_ROLE_NAME", "Revive Pings")
 
+# 16+ Engaging Conversation Starters
 ENGAGING_CONVERSATION_TOPICS = [
-    "What game or show has everyone been hooked on recently?",
-    "If you could travel anywhere tomorrow with all expenses paid, where would you go?",
-    "Drop your current favorite song or album recommendation right now!",
-    "Hot take time: What is an opinion you have that would start an argument here?",
-    "What's the best meal you've eaten all month?",
-    "If you could master any skill instantly, what are you picking?",
-    "What was the highlight of your week so far?"
+    "What game or show has everyone been completely hooked on recently?",
+    "If you could travel anywhere tomorrow with all expenses paid, where are you heading?",
+    "Drop your current favorite song, album, or artist recommendation right now!",
+    "Hot take time: What is an opinion you have that would start a debate here?",
+    "What is the best meal or dessert you've eaten all month?",
+    "If you could master any skill or superpower instantly, what are you picking?",
+    "What has been the absolute highlight of your week so far?",
+    "PC, Console, or Mobile? What is your primary gaming setup and why?",
+    "What is the most overrated movie or TV show everyone seems to love?",
+    "If you had to eat only one cuisine (Italian, Mexican, Japanese, etc.) forever, which one wins?",
+    "What's a weird habit or pet peeve you have that nobody else seems to understand?",
+    "What was the first video game you ever played that made you love gaming?",
+    "Are you an early bird or a night owl? What does your sleep schedule look like?",
+    "What is something on your bucket list that you plan on doing this year?",
+    "If you were handed $10,000 cash right now to spend in 24 hours, what are you buying?",
+    "What upcoming game, movie, or event are you most hyped for right now?"
 ]
 
 
@@ -148,6 +158,7 @@ class Revive(commands.Cog):
         embed.set_footer(text="Project-Edith • Server Pulse | Next revive in 2 hours")
         return embed
 
+    # --- Slash Command: /revive [topic] ---
     @app_commands.command(name="revive", description="Alert opt-in revive members to awaken chat discussions (Authority only).")
     @app_commands.describe(topic="Optional custom question or topic to start discussion")
     async def slash_revive(self, interaction: discord.Interaction, topic: str = None):
@@ -192,6 +203,7 @@ class Revive(commands.Cog):
         except Exception:
             await interaction.followup.send("❌ Discord blocked the broadcast. Verify Edith's permissions to mention roles.", ephemeral=True)
 
+    # --- Prefix Command: .revive [topic] or ;revive [topic] ---
     @commands.command(name="revive", aliases=["chatrevive", "wake"])
     async def prefix_revive(self, ctx: commands.Context, *, topic: str = None):
         if not is_revive_authorized(ctx.author):
@@ -199,7 +211,7 @@ class Revive(commands.Cog):
                 await ctx.message.delete()
             except Exception:
                 pass
-            await ctx.send("⛔ **Access Denied:** Only Administrators, Directors, and Authority roles may use `.revive`.", delete_after=5)
+            await ctx.send("⛔ **Access Denied:** Only Administrators, Directors, and Authority roles may use this command.", delete_after=5)
             return
 
         can_revive, remaining, time_str = await self.get_cooldown_status(ctx.guild.id)
