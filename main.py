@@ -5,6 +5,7 @@ import asyncio
 import traceback
 import aiosqlite
 import discord
+from discord import app_commands
 from discord.ext import commands
 from datetime import datetime, timezone
 import config
@@ -73,16 +74,11 @@ class UtilityBot(commands.Bot):
         self.restore_report["is_fresh"] = True
 
     async def setup_hook(self):
-        # 1. Download snapshot from Discord channel
         await self.restore_database_from_discord()
-
-        # 2. Establish SQLite connection
         self.db = await aiosqlite.connect(DB_PATH)
-
-        # 3. Enable WAL mode to avoid database locks during live snapshots
         await self.db.execute("PRAGMA journal_mode=WAL;")
 
-        # 4. Create all schema tables
+        # Initialize all schemas
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS birthdays (
                 user_id INTEGER PRIMARY KEY,
@@ -154,7 +150,7 @@ class UtilityBot(commands.Bot):
         """)
         await self.db.commit()
 
-        # 5. Dynamic cog loading with duplicate protection
+        # Dynamic cog loading with duplicate protection
         if not self._extensions_loaded:
             cogs_dir = os.path.join(os.path.dirname(__file__), "cogs")
             if os.path.exists(cogs_dir):
@@ -171,7 +167,7 @@ class UtilityBot(commands.Bot):
                                 print(f"[COG ERROR] Failed loading {cog_name}: {e}", file=sys.stderr)
             self._extensions_loaded = True
 
-        # 6. Global slash command sync
+        # Global slash command sync
         try:
             synced = await self.tree.sync()
             self.slash_sync_count = len(synced)
@@ -179,6 +175,32 @@ class UtilityBot(commands.Bot):
         except Exception as e:
             self.slash_sync_count = -1
             print(f"[SLASH ERROR] Slash command sync failed: {e}", file=sys.stderr)
+
+        # Global tree error hook
+        self.tree.on_error = self.on_tree_error
+
+    async def on_tree_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        err_tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        print(f"[SLASH ERROR in /{interaction.command.name if interaction.command else 'Unknown'}] {err_tb}", file=sys.stderr)
+
+        if not interaction.response.is_done():
+            await interaction.response.send_message("⚠️ An error occurred while executing this command. Staff has been alerted.", ephemeral=True)
+        else:
+            await interaction.followup.send("⚠️ An error occurred while executing this command. Staff has been alerted.", ephemeral=True)
+
+        if interaction.guild:
+            err_chan = await self.get_or_create_error_log_channel(interaction.guild)
+            if err_chan:
+                embed = discord.Embed(
+                    title=f"⚠️ Slash Command Error: `/{interaction.command.name if interaction.command else 'Unknown'}`",
+                    description=f"**User:** {interaction.user.mention} (`{interaction.user.id}`)\n**Channel:** {interaction.channel.mention}\n```python\n{err_tb[:1700]}\n```",
+                    color=discord.Color.red(),
+                    timestamp=datetime.now(timezone.utc)
+                )
+                try:
+                    await err_chan.send(embed=embed)
+                except Exception:
+                    pass
 
     async def get_or_create_error_log_channel(self, guild: discord.Guild) -> discord.TextChannel | None:
         err_id = int(os.getenv("BOT_ERRORS_CHANNEL_ID", getattr(config, "BOT_ERRORS_CHANNEL_ID", 0)))
@@ -237,7 +259,7 @@ class UtilityBot(commands.Bot):
                 if perms.send_messages and perms.attach_files:
                     tests.append(("Cloud Backup Vault", f"✅ PASS (#{b_chan.name})"))
                 else:
-                    tests.append(("Cloud Backup Vault", "⚠️ WARN (Missing Send/Attach permissions)"))
+                    tests.append(("Cloud Backup Vault", "⚠️ WARN (Missing Permissions)"))
                     overall_healthy = False
             else:
                 tests.append(("Cloud Backup Vault", "⚠️ WARN (Channel not accessible)"))
@@ -319,7 +341,7 @@ class UtilityBot(commands.Bot):
         if err_chan:
             embed = discord.Embed(
                 title=f"⚠️ Command Failure: `.{ctx.command}`",
-                description=f"**User:** {ctx.author.mention} (`{ctx.author.id}`)\n**Channel:** {ctx.channel.mention}\n```python\n{err_tb[:1800]}\n```",
+                description=f"**User:** {ctx.author.mention} (`{ctx.author.id}`)\n**Channel:** {ctx.channel.mention}\n```python\n{err_tb[:1700]}\n```",
                 color=discord.Color.red(),
                 timestamp=datetime.now(timezone.utc)
             )
