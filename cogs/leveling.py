@@ -457,7 +457,8 @@ class Leveling(commands.Cog):
         if message.author.bot or not message.guild:
             return
 
-        if message.content.startswith("."):
+        # Explicitly ignore all bot command prefixes
+        if message.content.startswith((".", ";")):
             return
 
         now = time.time()
