@@ -39,7 +39,6 @@ class UtilityBot(commands.Bot):
         }
 
     async def restore_database_from_discord(self):
-        """Scans the backup channel for the latest .db snapshot before database initialization."""
         backup_id = int(os.getenv("BACKUP_CHANNEL_ID", getattr(config, "BACKUP_CHANNEL_ID", 0)))
         if not backup_id or backup_id == 0:
             print("[RESTORE] BACKUP_CHANNEL_ID is unset. Starting clean local database.")
@@ -83,7 +82,7 @@ class UtilityBot(commands.Bot):
         # 3. Enable WAL mode to avoid database locks during live snapshots
         await self.db.execute("PRAGMA journal_mode=WAL;")
 
-        # 4. Create all necessary schema tables
+        # 4. Create all schema tables
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS birthdays (
                 user_id INTEGER PRIMARY KEY,
@@ -142,6 +141,15 @@ class UtilityBot(commands.Bot):
                 moderator_id INTEGER NOT NULL,
                 reason TEXT NOT NULL,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS afk_users (
+                user_id INTEGER PRIMARY KEY,
+                guild_id INTEGER NOT NULL,
+                reason TEXT DEFAULT 'AFK',
+                timestamp INTEGER NOT NULL,
+                original_nickname TEXT
             )
         """)
         await self.db.commit()
@@ -293,7 +301,6 @@ class UtilityBot(commands.Bot):
                     print(f"[DIAGNOSTICS DISPATCH ERROR] {e}")
 
     async def on_command_error(self, ctx: commands.Context, error: Exception):
-        """Catches and reports runtime command failures to chat and #bot-errors."""
         if isinstance(error, commands.CommandNotFound):
             return
 
@@ -336,7 +343,6 @@ class UtilityBot(commands.Bot):
 bot = UtilityBot()
 
 
-# --- Command: .sync / ;sync (Forces instant registration of slash commands) ---
 @bot.command(name="sync")
 @commands.has_permissions(administrator=True)
 async def instant_sync(ctx: commands.Context):
@@ -350,7 +356,6 @@ async def instant_sync(ctx: commands.Context):
         await msg.edit(content=f"❌ Sync failed: `{e}`")
 
 
-# --- Command: .list / ;list / .help ---
 @bot.command(name="list", aliases=["commands", "help"])
 async def list_commands(ctx: commands.Context):
     """Displays a directory of all available server commands."""
@@ -369,6 +374,7 @@ async def list_commands(ctx: commands.Context):
     embed.add_field(
         name="🎮 Engagement & Community",
         value=(
+            "• `;afk [message]` — Set AFK status with custom message & nickname tag\n"
             "• `;rank [@user]` — Check level, messages, voice time & progress\n"
             "• `;bump` — Boost server rank & earn **+200 XP** (2h cooldown)\n"
             "• `;list` — Display this command directory"
@@ -397,7 +403,7 @@ async def list_commands(ctx: commands.Context):
         value=(
             "• `;announce [#channel]` — Launch announcement draft studio\n"
             "• `;welcome [#channel]` — Deploy the long-form welcome guide\n"
-            "• `;revive [topic]` — Ping Revive Pings role to wake up chat\n"
+            "• `;revive [topic]` — Ping Revive Pings role with conversation starter\n"
             "• `;backup` — Force manual SQLite snapshot to `#bot-memory`\n"
             "• `;sync` — Instantly sync slash commands to current server"
         ),
