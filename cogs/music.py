@@ -8,11 +8,20 @@ from discord import app_commands
 from discord.ext import commands
 import yt_dlp
 
-# Verify voice support dependencies
-VOICE_SUPPORT_AVAILABLE = discord.opus.is_loaded() or hasattr(discord, "VoiceClient")
 FFMPEG_EXECUTABLE = shutil.which("ffmpeg") or "ffmpeg"
 
-YTDL_FORMAT_OPTIONS = {
+# If raw cookies are injected via Render environment variable, write them to disk
+COOKIE_FILE_PATH = "cookies.txt"
+env_cookies = os.getenv("YOUTUBE_COOKIES")
+if env_cookies and not os.path.exists(COOKIE_FILE_PATH):
+    try:
+        with open(COOKIE_FILE_PATH, "w", encoding="utf-8") as f:
+            f.write(env_cookies.strip())
+        print("[MUSIC AUTH] Successfully created cookies.txt from environment.")
+    except Exception as e:
+        print(f"[MUSIC AUTH WARNING] Could not write cookies.txt: {e}")
+
+YTDL_BASE_OPTIONS = {
     'format': 'bestaudio/best',
     'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
     'restrictfilenames': True,
@@ -22,16 +31,27 @@ YTDL_FORMAT_OPTIONS = {
     'logtostderr': False,
     'quiet': True,
     'no_warnings': True,
-    'default_search': 'ytsearch',
     'source_address': '0.0.0.0',
+    # Emulate mobile and TV clients to bypass web bot verification walls
+    'extractor_args': {
+        'youtube': {
+            'player_client': ['ios', 'android', 'tvhtml5', 'mweb'],
+            'player_skip': ['webpage', 'configs'],
+        }
+    },
+    'http_headers': {
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
+        'Accept-Language': 'en-US,en;q=0.9',
+    }
 }
+
+if os.path.exists(COOKIE_FILE_PATH):
+    YTDL_BASE_OPTIONS['cookiefile'] = COOKIE_FILE_PATH
 
 FFMPEG_OPTIONS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
     'options': '-vn -filter:a "volume=0.8"',
 }
-
-ytdl = yt_dlp.YoutubeDL(YTDL_FORMAT_OPTIONS)
 
 
 class Song:
@@ -48,11 +68,32 @@ class Song:
     @classmethod
     async def from_query(cls, query: str, requester: discord.Member, loop=None):
         loop = loop or asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=False))
+
+        def extract(search_term: str):
+            # Attempt YouTube resolution first with mobile client headers
+            ydl_opts = dict(YTDL_BASE_OPTIONS)
+            ydl_opts['default_search'] = 'ytsearch'
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                try:
+                    return ydl.extract_info(search_term, download=False)
+                except Exception as yt_err:
+                    err_msg = str(yt_err).lower()
+                    # Fallback to SoundCloud if YouTube blocks or challenges datacenter IP
+                    if "confirm you’re not a bot" in err_msg or "sign in" in err_msg or "http error 429" in err_msg:
+                        print(f"[YTDL FALLBACK] YouTube bot check triggered. Retrying on SoundCloud: {search_term}")
+                        ydl_sc_opts = dict(YTDL_BASE_OPTIONS)
+                        ydl_sc_opts['default_search'] = 'scsearch'
+                        with yt_dlp.YoutubeDL(ydl_sc_opts) as sc_ydl:
+                            return sc_ydl.extract_info(search_term, download=False)
+                    raise yt_err
+
+        data = await loop.run_in_executor(None, lambda: extract(query))
+
         if 'entries' in data:
             if not data['entries']:
-                raise ValueError("No matching audio found.")
+                raise ValueError("No matching audio track could be located.")
             data = data['entries'][0]
+
         return cls(data, requester)
 
     def format_duration(self) -> str:
@@ -175,7 +216,7 @@ class GuildMusicState:
                     **FFMPEG_OPTIONS
                 )
             except Exception as e:
-                print(f"[FFMPEG INITIALIZATION ERROR] {e}")
+                print(f"[FFMPEG RUNTIME ERROR] {e}")
                 continue
 
             def after_playback(err):
@@ -274,7 +315,7 @@ class Music(commands.Cog):
         return vc
 
     @app_commands.command(name="play", description="Play a track or add it to the AtomMusic player queue.")
-    @app_commands.describe(query="Song title, artist name, or YouTube/SoundCloud URL")
+    @app_commands.describe(query="Song title, artist name, or direct URL")
     async def slash_play(self, interaction: discord.Interaction, query: str):
         vc = await self.ensure_voice_connection(interaction)
         if not vc:
