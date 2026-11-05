@@ -45,14 +45,13 @@ class DiscordMemoryBackup(commands.Cog):
         return temp
 
     async def prune_stale_backups_and_texts(self, channel: discord.TextChannel):
-        """Strictly keeps only the last 3 backup attachments and purges all old text notices/logs."""
+        """Strictly keeps only the last 3 backup snapshots and purges all old text notices/logs."""
         try:
             backup_messages = []
             stray_bot_messages = []
 
             async for msg in channel.history(limit=100):
                 if msg.author == self.bot.user:
-                    # Check if this message has a database attachment
                     has_db = any(a.filename.endswith(".db") for a in msg.attachments)
                     if has_db:
                         backup_messages.append(msg)
