@@ -10,7 +10,6 @@ import yt_dlp
 
 FFMPEG_EXECUTABLE = shutil.which("ffmpeg") or "ffmpeg"
 
-# Native SoundCloud / Direct Stream Options (No cookies required)
 YTDL_OPTIONS = {
     'format': 'bestaudio/best',
     'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
@@ -21,13 +20,16 @@ YTDL_OPTIONS = {
     'logtostderr': False,
     'quiet': True,
     'no_warnings': True,
-    'default_search': 'scsearch',  # Defaults to SoundCloud search
+    'default_search': 'scsearch',
     'source_address': '0.0.0.0',
+    'http_headers': {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    }
 }
 
 FFMPEG_OPTIONS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn -filter:a "volume=0.8"',
+    'options': '-vn',
 }
 
 
@@ -40,15 +42,13 @@ class Song:
         self.stream_url = data.get('url', '')
         self.duration = data.get('duration', 0)
         self.thumbnail = data.get('thumbnail', None)
-        self.uploader = data.get('uploader', 'SoundCloud Artist')
+        self.uploader = data.get('uploader', 'Artist')
 
     @classmethod
     async def from_query(cls, query: str, requester: discord.Member, loop=None):
         loop = loop or asyncio.get_event_loop()
 
         def extract():
-            # If the user provides a direct link (Bandcamp, SoundCloud, direct audio URL), stream directly.
-            # If plain text, search SoundCloud without touching YouTube bot gates.
             ydl_opts = dict(YTDL_OPTIONS)
             if not query.startswith(("http://", "https://")):
                 search_query = f"scsearch:{query}"
@@ -69,7 +69,7 @@ class Song:
 
     def format_duration(self) -> str:
         if not self.duration:
-            return "🔴 Live Stream"
+            return "🔴 Live / Unknown"
         mins, secs = divmod(int(self.duration), 60)
         hours, mins = divmod(mins, 60)
         if hours > 0:
@@ -154,6 +154,7 @@ class GuildMusicState:
         self.current_song: Song = None
         self.voice_client: discord.VoiceClient = None
         self.current_message: discord.Message = None
+        self.text_channel: discord.TextChannel = None
         self.play_next_song = asyncio.Event()
         self.audio_loop_task = bot.loop.create_task(self.audio_player_loop())
 
@@ -181,13 +182,16 @@ class GuildMusicState:
 
             self.current_song = self.queue.popleft()
             try:
-                source = discord.FFmpegPCMAudio(
+                raw_source = discord.FFmpegPCMAudio(
                     self.current_song.stream_url,
                     executable=FFMPEG_EXECUTABLE,
                     **FFMPEG_OPTIONS
                 )
+                source = discord.PCMVolumeTransformer(raw_source, volume=0.8)
             except Exception as e:
                 print(f"[FFMPEG RUNTIME ERROR] {e}")
+                if self.text_channel:
+                    await self.text_channel.send(f"⚠️ Audio decode error: `{e}`", delete_after=8)
                 continue
 
             def after_playback(err):
@@ -210,7 +214,7 @@ class GuildMusicState:
             await asyncio.sleep(2)
 
     async def update_controller_ui(self):
-        if not self.current_song:
+        if not self.current_song or not self.text_channel:
             return
 
         embed = discord.Embed(
@@ -246,12 +250,10 @@ class GuildMusicState:
             except Exception:
                 pass
 
-        text_channel = self.current_song.requester.guild.system_channel or self.current_song.requester.guild.text_channels[0]
-        if text_channel:
-            try:
-                self.current_message = await text_channel.send(embed=embed, view=view)
-            except Exception:
-                pass
+        try:
+            self.current_message = await self.text_channel.send(embed=embed, view=view)
+        except Exception as e:
+            print(f"[UI CONTROLLER DISPATCH ERROR] {e}")
 
 
 class Music(commands.Cog):
@@ -295,6 +297,7 @@ class Music(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         state = self.get_music_state(interaction.guild)
         state.voice_client = vc
+        state.text_channel = interaction.channel  # Bind the controller to this channel
 
         try:
             song = await Song.from_query(query, requester=interaction.user, loop=self.bot.loop)
@@ -325,6 +328,7 @@ class Music(commands.Cog):
 
         state = self.get_music_state(ctx.guild)
         state.voice_client = vc
+        state.text_channel = ctx.channel
 
         load_msg = await ctx.send("🔍 *Searching stream tracks...*")
         try:
