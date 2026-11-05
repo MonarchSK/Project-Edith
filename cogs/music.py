@@ -8,7 +8,21 @@ from discord import app_commands
 from discord.ext import commands
 import yt_dlp
 
-FFMPEG_EXECUTABLE = shutil.which("ffmpeg") or "ffmpeg"
+# Discover FFmpeg path across Render environment variations
+def resolve_ffmpeg_binary() -> str:
+    candidates = [
+        shutil.which("ffmpeg"),
+        "/usr/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        os.path.join(os.getcwd(), "bin", "ffmpeg"),
+        "/opt/render/project/src/bin/ffmpeg"
+    ]
+    for path in candidates:
+        if path and os.path.exists(path) and os.access(path, os.X_OK):
+            return path
+    return "ffmpeg"
+
+FFMPEG_EXECUTABLE = resolve_ffmpeg_binary()
 
 YTDL_OPTIONS = {
     'format': 'bestaudio/best',
@@ -62,7 +76,7 @@ class Song:
 
         if 'entries' in data:
             if not data['entries']:
-                raise ValueError("No matching audio track could be found.")
+                raise ValueError("No matching audio track could be located.")
             data = data['entries'][0]
 
         return cls(data, requester)
@@ -182,7 +196,7 @@ class GuildMusicState:
 
             self.current_song = self.queue.popleft()
 
-            # Ensure direct stream URL is fresh before sending to FFmpeg
+            # Refresh tokenized stream URL immediately prior to starting playback
             stream_url = self.current_song.stream_url
             if not stream_url or "manifest" in stream_url:
                 try:
@@ -300,6 +314,24 @@ class Music(commands.Cog):
 
         return vc
 
+    @commands.command(name="testaudio")
+    async def test_audio(self, ctx: commands.Context):
+        """Plays an unblocked direct audio sample to test FFmpeg and voice routing."""
+        vc = await self.ensure_voice_connection(ctx)
+        if not vc:
+            return
+
+        msg = await ctx.send(f"🔍 Testing system audio pipeline...\n• **FFmpeg Binary:** `{FFMPEG_EXECUTABLE}`\n• **Voice Gateway:** Connected")
+        test_url = "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"
+        try:
+            raw_source = discord.FFmpegPCMAudio(test_url, executable=FFMPEG_EXECUTABLE, **FFMPEG_OPTIONS)
+            source = discord.PCMVolumeTransformer(raw_source, volume=0.8)
+            vc.stop()
+            vc.play(source)
+            await msg.edit(content=f"🔊 **Now playing raw MP3 stream.**\nIf you hear sound, FFmpeg and PyNaCl are functional.")
+        except Exception as e:
+            await msg.edit(content=f"❌ **Direct audio pipeline failed:** `{e}`")
+
     @app_commands.command(name="play", description="Play a track or add it to the AtomMusic player queue.")
     @app_commands.describe(query="Song title, artist name, or direct URL")
     async def slash_play(self, interaction: discord.Interaction, query: str):
@@ -365,25 +397,6 @@ class Music(commands.Cog):
             if song.thumbnail:
                 embed.set_thumbnail(url=song.thumbnail)
             await ctx.send(embed=embed, delete_after=10)
-
-    @commands.command(name="testaudio")
-    async def test_audio(self, ctx: commands.Context):
-        """Streams a direct MP3 stream to verify whether FFmpeg and voice transmission are working."""
-        vc = await self.ensure_voice_connection(ctx)
-        if not vc:
-            return
-
-        test_url = "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"
-        try:
-            source = discord.PCMVolumeTransformer(
-                discord.FFmpegPCMAudio(test_url, executable=FFMPEG_EXECUTABLE, **FFMPEG_OPTIONS),
-                volume=0.8
-            )
-            vc.stop()
-            vc.play(source)
-            await ctx.send("🔊 **Streaming direct test MP3.** If you hear music, voice sending and FFmpeg are working!")
-        except Exception as e:
-            await ctx.send(f"❌ Direct audio failed: `{e}`")
 
     @commands.command(name="queue", aliases=["q"])
     async def prefix_queue(self, ctx: commands.Context):
