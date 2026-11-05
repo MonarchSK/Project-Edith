@@ -18,6 +18,119 @@ intents.message_content = True
 intents.voice_states = True
 
 
+def generate_command_directory_embed(bot: commands.Bot, guild: discord.Guild) -> discord.Embed:
+    """Dynamically builds an scannable directory by reading active commands across loaded cogs."""
+    total_commands = len([c for c in bot.commands if not c.hidden])
+    
+    embed = discord.Embed(
+        title="🤖 Project-Edith // Active Command Roster",
+        description=(
+            f"**Server Scope:** {guild.name}\n"
+            "**Accepted Prefixes:** `.` or `;` | **Slash Commands:** `/`\n"
+            f"**Total Available Directives:** `{total_commands}`\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        ),
+        color=discord.Color.from_rgb(0, 168, 252),
+        timestamp=datetime.now(timezone.utc)
+    )
+
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+
+    # Human-readable cog aliases & emojis
+    cog_branding = {
+        "Leveling": ("🎮 Progression & Leveling", "Track XP, voice minutes, and rank milestones"),
+        "Bumping": ("🚀 Server Bump Engine", "Bump server ranking and claim +200 XP rewards"),
+        "AFK": ("💤 AFK & Away Protocols", "Custom auto-responder away messages and nickname prefixes"),
+        "Moderation": ("🛡️ Staff Moderation & Sanctions", "Infraction management, timeouts, kicks, and bans"),
+        "Announcements": ("📢 Broadcast Studio", "Formal server broadcasts and preview delivery"),
+        "Revive": ("⚡ Chat Revive Protocols", "Server activity triggers and engaging discussion prompts"),
+        "Welcome": ("🌐 Gateway & Welcome Portal", "Persistent server rules, channel maps, and guide panels"),
+        "DiscordMemoryBackup": ("📦 Persistent Storage Vault", "SQLite snapshot persistence to Discord cloud")
+    }
+
+    for cog_name, cog in sorted(bot.cogs.items()):
+        cog_commands = cog.get_commands()
+        if not cog_commands:
+            continue
+
+        cmd_lines = []
+        for cmd in cog_commands:
+            if cmd.hidden:
+                continue
+            desc = cmd.help or cmd.description or "Execute command"
+            # Extract first sentence of help string
+            first_sentence = desc.split("\n")[0].split(". ")[0].strip()
+            if not first_sentence.endswith("."):
+                first_sentence += "."
+            cmd_lines.append(f"`{bot.command_prefix[0] if isinstance(bot.command_prefix, (list, tuple)) else '.'}{cmd.name}` — {first_sentence}")
+
+        if cmd_lines:
+            header_title, _ = cog_branding.get(cog_name, (f"📦 {cog_name}", ""))
+            embed.add_field(
+                name=header_title,
+                value="\n".join(cmd_lines[:8]),
+                inline=False
+            )
+
+    embed.set_footer(text="Project-Edith • Live Auto-Updating Directory", icon_url=bot.user.display_avatar.url if bot.user else None)
+    return embed
+
+
+async def update_command_channel_panel(bot: commands.Bot, guild: discord.Guild):
+    """Finds or creates a permanent command panel in the designated commands channel and edits it in-place."""
+    channel_id = int(os.getenv("COMMANDS_CHANNEL_ID", getattr(config, "COMMANDS_CHANNEL_ID", 0)))
+    channel = None
+
+    if channel_id and channel_id != 0:
+        channel = guild.get_channel(channel_id)
+        if not channel:
+            try:
+                channel = await guild.fetch_channel(channel_id)
+            except Exception:
+                channel = None
+
+    # Fallback to channel named bot-commands or commands if ID is unset
+    if not channel:
+        for c in guild.text_channels:
+            if c.name.lower() in ["bot-commands", "commands", "cmd-list", "bot-directives"]:
+                channel = c
+                break
+
+    if not channel:
+        return
+
+    perms = channel.permissions_for(guild.me)
+    if not perms.send_messages or not perms.embed_links:
+        print(f"[PANEL WARNING] Missing send/embed permissions in #{channel.name}")
+        return
+
+    embed = generate_command_directory_embed(bot, guild)
+
+    try:
+        target_msg = None
+        async for msg in channel.history(limit=30):
+            if msg.author == bot.user and msg.embeds:
+                title = msg.embeds[0].title or ""
+                if "Active Command Roster" in title or "Command Matrix" in title:
+                    target_msg = msg
+                    break
+
+        if target_msg:
+            await target_msg.edit(embed=embed)
+            print(f"[PANEL] Updated active command directory in #{channel.name}")
+        else:
+            new_msg = await channel.send(embed=embed)
+            try:
+                if perms.manage_messages:
+                    await new_msg.pin(reason="Persistent Command Roster")
+            except Exception:
+                pass
+            print(f"[PANEL] Created new command directory in #{channel.name}")
+    except Exception as e:
+        print(f"[PANEL ERROR] Failed updating #{channel.name}: {e}")
+
+
 class UtilityBot(commands.Bot):
     def __init__(self):
         super().__init__(
@@ -78,7 +191,7 @@ class UtilityBot(commands.Bot):
         self.db = await aiosqlite.connect(DB_PATH)
         await self.db.execute("PRAGMA journal_mode=WAL;")
 
-        # Initialize all schemas
+        # Schemas
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS birthdays (
                 user_id INTEGER PRIMARY KEY,
@@ -176,17 +289,17 @@ class UtilityBot(commands.Bot):
             self.slash_sync_count = -1
             print(f"[SLASH ERROR] Slash command sync failed: {e}", file=sys.stderr)
 
-        # Global tree error hook
         self.tree.on_error = self.on_tree_error
 
     async def on_tree_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         err_tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
         print(f"[SLASH ERROR in /{interaction.command.name if interaction.command else 'Unknown'}] {err_tb}", file=sys.stderr)
 
+        msg = "⚠️ An error occurred while executing this directive. Staff has been notified."
         if not interaction.response.is_done():
-            await interaction.response.send_message("⚠️ An error occurred while executing this command. Staff has been alerted.", ephemeral=True)
+            await interaction.response.send_message(msg, ephemeral=True)
         else:
-            await interaction.followup.send("⚠️ An error occurred while executing this command. Staff has been alerted.", ephemeral=True)
+            await interaction.followup.send(msg, ephemeral=True)
 
         if interaction.guild:
             err_chan = await self.get_or_create_error_log_channel(interaction.guild)
@@ -314,6 +427,12 @@ class UtilityBot(commands.Bot):
         )
 
         for guild in self.guilds:
+            # Auto-update permanent command panel on startup
+            try:
+                await update_command_channel_panel(self, guild)
+            except Exception as e:
+                print(f"[AUTO-PANEL ERROR in {guild.name}] {e}")
+
             err_channel = await self.get_or_create_error_log_channel(guild)
             if err_channel:
                 try:
@@ -368,71 +487,24 @@ bot = UtilityBot()
 @bot.command(name="sync")
 @commands.has_permissions(administrator=True)
 async def instant_sync(ctx: commands.Context):
-    """Instantly syncs slash commands directly to the current guild in 1 second."""
-    msg = await ctx.send("⏳ Registering slash commands to this guild...")
+    """Instantly syncs slash commands directly to the current guild in 1 second and refreshes the command panel."""
+    msg = await ctx.send("⏳ Registering slash commands and updating command roster...")
     try:
         bot.tree.copy_global_to(guild=ctx.guild)
         synced = await bot.tree.sync(guild=ctx.guild)
-        await msg.edit(content=f"✅ **Synced {len(synced)} slash commands instantly!** You can now use `/` commands immediately.")
+        
+        # Refresh the command panel
+        await update_command_channel_panel(bot, ctx.guild)
+        
+        await msg.edit(content=f"✅ **Synced {len(synced)} slash commands and updated command roster!**")
     except Exception as e:
         await msg.edit(content=f"❌ Sync failed: `{e}`")
 
 
 @bot.command(name="list", aliases=["commands", "help"])
 async def list_commands(ctx: commands.Context):
-    """Displays a directory of all available server commands."""
-    embed = discord.Embed(
-        title="🤖 Project-Edith // Command Matrix",
-        description=(
-            "Accepted Prefixes: `.` or `;` | Slash Commands: `/`\n"
-            "Below is the complete roster of operative and administrative tools."
-        ),
-        color=discord.Color.from_rgb(0, 168, 252),
-        timestamp=datetime.now(timezone.utc)
-    )
-    if ctx.guild.icon:
-        embed.set_thumbnail(url=ctx.guild.icon.url)
-
-    embed.add_field(
-        name="🎮 Engagement & Community",
-        value=(
-            "• `;afk [message]` — Set AFK status with custom message & nickname tag\n"
-            "• `;rank [@user]` — Check level, messages, voice time & progress\n"
-            "• `;bump` — Boost server rank & earn **+200 XP** (2h cooldown)\n"
-            "• `;list` — Display this command directory"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="🛡️ Moderation & Enforcement (Staff)",
-        value=(
-            "• `;warn @user [reason]` — Issue an infraction notice\n"
-            "• `;warnings [@user]` — View infraction history\n"
-            "• `;clearwarns @user` — Wipe user warnings *(Admin only)*\n"
-            "• `;mute @user [time] [reason]` — Timeout member (e.g. `10m`, `2h`)\n"
-            "• `;unmute @user` — Lift active timeout\n"
-            "• `;kick @user [reason]` — Eject member from server\n"
-            "• `;ban @user [reason]` — Permanently ban member\n"
-            "• `;unban <id> [reason]` — Revoke ban by User ID\n"
-            "• `;purge <1-100> [@user]` — Clean chat messages with auto-destruct confirmation"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="⚡ Broadcast & Control (Director/Admin)",
-        value=(
-            "• `;announce [#channel]` — Launch announcement draft studio\n"
-            "• `;welcome [#channel]` — Deploy the long-form welcome guide\n"
-            "• `;revive [topic]` — Ping Revive Pings role with conversation starter\n"
-            "• `;backup` — Force manual SQLite snapshot to `#bot-memory`\n"
-            "• `;sync` — Instantly sync slash commands to current server"
-        ),
-        inline=False
-    )
-
-    embed.set_footer(text=f"Requested by {ctx.author.display_name} • Project-Edith")
+    """Generates an on-demand command directory embed in the active channel."""
+    embed = generate_command_directory_embed(bot, ctx.guild)
     await ctx.send(embed=embed)
 
 
