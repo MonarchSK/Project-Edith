@@ -28,8 +28,8 @@ YTDL_OPTIONS = {
 }
 
 FFMPEG_OPTIONS = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn',
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin',
+    'options': '-vn -b:a 128k',
 }
 
 
@@ -38,11 +38,11 @@ class Song:
         self.data = data
         self.requester = requester
         self.title = data.get('title', 'Unknown Track')
-        self.url = data.get('webpage_url', '')
+        self.webpage_url = data.get('webpage_url', '')
         self.stream_url = data.get('url', '')
         self.duration = data.get('duration', 0)
         self.thumbnail = data.get('thumbnail', None)
-        self.uploader = data.get('uploader', 'Artist')
+        self.uploader = data.get('uploader', 'SoundCloud / Artist')
 
     @classmethod
     async def from_query(cls, query: str, requester: discord.Member, loop=None):
@@ -69,7 +69,7 @@ class Song:
 
     def format_duration(self) -> str:
         if not self.duration:
-            return "🔴 Live / Unknown"
+            return "🔴 Live / Stream"
         mins, secs = divmod(int(self.duration), 60)
         hours, mins = divmod(mins, 60)
         if hours > 0:
@@ -181,9 +181,22 @@ class GuildMusicState:
                 continue
 
             self.current_song = self.queue.popleft()
+
+            # Ensure direct stream URL is fresh before sending to FFmpeg
+            stream_url = self.current_song.stream_url
+            if not stream_url or "manifest" in stream_url:
+                try:
+                    with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ydl:
+                        refreshed = await self.bot.loop.run_in_executor(
+                            None, lambda: ydl.extract_info(self.current_song.webpage_url, download=False)
+                        )
+                        stream_url = refreshed.get('url', stream_url)
+                except Exception as e:
+                    print(f"[STREAM REFRESH ERROR] {e}")
+
             try:
                 raw_source = discord.FFmpegPCMAudio(
-                    self.current_song.stream_url,
+                    stream_url,
                     executable=FFMPEG_EXECUTABLE,
                     **FFMPEG_OPTIONS
                 )
@@ -191,7 +204,7 @@ class GuildMusicState:
             except Exception as e:
                 print(f"[FFMPEG RUNTIME ERROR] {e}")
                 if self.text_channel:
-                    await self.text_channel.send(f"⚠️ Audio decode error: `{e}`", delete_after=8)
+                    await self.text_channel.send(f"⚠️ Audio decode failure: `{e}`", delete_after=8)
                 continue
 
             def after_playback(err):
@@ -219,19 +232,19 @@ class GuildMusicState:
 
         embed = discord.Embed(
             title="🎵 AtomMusic // Active Playback",
-            description=f"[{self.current_song.title}]({self.current_song.url})",
+            description=f"[{self.current_song.title}]({self.current_song.webpage_url})",
             color=discord.Color.from_rgb(0, 204, 255)
         )
         if self.current_song.thumbnail:
             embed.set_thumbnail(url=self.current_song.thumbnail)
 
-        embed.add_field(name="Source / Platform", value=f"`SoundCloud / Direct`", inline=True)
+        embed.add_field(name="Source / Platform", value="`SoundCloud / Direct`", inline=True)
         embed.add_field(name="Duration", value=f"`{self.current_song.format_duration()}`", inline=True)
         embed.add_field(name="Requested By", value=self.current_song.requester.mention, inline=True)
 
         if self.queue:
             next_up = list(self.queue)[:3]
-            lines = [f"`{idx+1}.` [{s.title[:38]}]({s.url}) (`{s.format_duration()}`)" for idx, s in enumerate(next_up)]
+            lines = [f"`{idx+1}.` [{s.title[:38]}]({s.webpage_url}) (`{s.format_duration()}`)" for idx, s in enumerate(next_up)]
             remaining = len(self.queue) - len(next_up)
             queue_str = "\n".join(lines)
             if remaining > 0:
@@ -288,7 +301,7 @@ class Music(commands.Cog):
         return vc
 
     @app_commands.command(name="play", description="Play a track or add it to the AtomMusic player queue.")
-    @app_commands.describe(query="Song title, artist name, or SoundCloud/direct link")
+    @app_commands.describe(query="Song title, artist name, or direct URL")
     async def slash_play(self, interaction: discord.Interaction, query: str):
         vc = await self.ensure_voice_connection(interaction)
         if not vc:
@@ -297,7 +310,7 @@ class Music(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         state = self.get_music_state(interaction.guild)
         state.voice_client = vc
-        state.text_channel = interaction.channel  # Bind the controller to this channel
+        state.text_channel = interaction.channel
 
         try:
             song = await Song.from_query(query, requester=interaction.user, loop=self.bot.loop)
@@ -310,7 +323,7 @@ class Music(commands.Cog):
         if vc.is_playing() or vc.is_paused():
             embed = discord.Embed(
                 title="📑 Added to Queue",
-                description=f"[{song.title}]({song.url})\n\n• **Duration:** `{song.format_duration()}`\n• **Queue Position:** `#{len(state.queue)}`",
+                description=f"[{song.title}]({song.webpage_url})\n\n• **Duration:** `{song.format_duration()}`\n• **Queue Position:** `#{len(state.queue)}`",
                 color=discord.Color.green()
             )
             if song.thumbnail:
@@ -346,12 +359,31 @@ class Music(commands.Cog):
         if vc.is_playing() or vc.is_paused():
             embed = discord.Embed(
                 title="📑 Added to Queue",
-                description=f"[{song.title}]({song.url})\n\n• **Duration:** `{song.format_duration()}`\n• **Queue Position:** `#{len(state.queue)}`",
+                description=f"[{song.title}]({song.webpage_url})\n\n• **Duration:** `{song.format_duration()}`\n• **Queue Position:** `#{len(state.queue)}`",
                 color=discord.Color.green()
             )
             if song.thumbnail:
                 embed.set_thumbnail(url=song.thumbnail)
             await ctx.send(embed=embed, delete_after=10)
+
+    @commands.command(name="testaudio")
+    async def test_audio(self, ctx: commands.Context):
+        """Streams a direct MP3 stream to verify whether FFmpeg and voice transmission are working."""
+        vc = await self.ensure_voice_connection(ctx)
+        if not vc:
+            return
+
+        test_url = "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"
+        try:
+            source = discord.PCMVolumeTransformer(
+                discord.FFmpegPCMAudio(test_url, executable=FFMPEG_EXECUTABLE, **FFMPEG_OPTIONS),
+                volume=0.8
+            )
+            vc.stop()
+            vc.play(source)
+            await ctx.send("🔊 **Streaming direct test MP3.** If you hear music, voice sending and FFmpeg are working!")
+        except Exception as e:
+            await ctx.send(f"❌ Direct audio failed: `{e}`")
 
     @commands.command(name="queue", aliases=["q"])
     async def prefix_queue(self, ctx: commands.Context):
@@ -368,12 +400,12 @@ class Music(commands.Cog):
         if state.current_song:
             embed.add_field(
                 name="▶️ Currently Playing",
-                value=f"[{state.current_song.title}]({state.current_song.url}) | `{state.current_song.format_duration()}` (Requested by {state.current_song.requester.mention})",
+                value=f"[{state.current_song.title}]({state.current_song.webpage_url}) | `{state.current_song.format_duration()}` (Requested by {state.current_song.requester.mention})",
                 inline=False
             )
 
         if state.queue:
-            lines = [f"`{idx+1}.` [{s.title}]({s.url}) (`{s.format_duration()}`)" for idx, s in enumerate(list(state.queue)[:10])]
+            lines = [f"`{idx+1}.` [{s.title}]({s.webpage_url}) (`{s.format_duration()}`)" for idx, s in enumerate(list(state.queue)[:10])]
             embed.add_field(name="Upcoming Tracks", value="\n".join(lines), inline=False)
 
         await ctx.send(embed=embed, delete_after=15)
