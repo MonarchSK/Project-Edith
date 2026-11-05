@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import config
 
 DB_PATH = "bot_database.db"
+KEEP_DIAGNOSTIC_REPORTS_COUNT = 3
 
 intents = discord.Intents.default()
 intents.members = True
@@ -21,7 +22,7 @@ intents.voice_states = True
 def generate_command_directory_embed(bot: commands.Bot, guild: discord.Guild) -> discord.Embed:
     """Dynamically builds an scannable directory by reading active commands across loaded cogs."""
     total_commands = len([c for c in bot.commands if not c.hidden])
-    
+
     embed = discord.Embed(
         title="🤖 Project-Edith // Active Command Roster",
         description=(
@@ -37,7 +38,6 @@ def generate_command_directory_embed(bot: commands.Bot, guild: discord.Guild) ->
     if guild.icon:
         embed.set_thumbnail(url=guild.icon.url)
 
-    # Human-readable cog aliases & emojis
     cog_branding = {
         "Leveling": ("🎮 Progression & Leveling", "Track XP, voice minutes, and rank milestones"),
         "Bumping": ("🚀 Server Bump Engine", "Bump server ranking and claim +200 XP rewards"),
@@ -46,7 +46,8 @@ def generate_command_directory_embed(bot: commands.Bot, guild: discord.Guild) ->
         "Announcements": ("📢 Broadcast Studio", "Formal server broadcasts and preview delivery"),
         "Revive": ("⚡ Chat Revive Protocols", "Server activity triggers and engaging discussion prompts"),
         "Welcome": ("🌐 Gateway & Welcome Portal", "Persistent server rules, channel maps, and guide panels"),
-        "DiscordMemoryBackup": ("📦 Persistent Storage Vault", "SQLite snapshot persistence to Discord cloud")
+        "DiscordMemoryBackup": ("📦 Persistent Storage Vault", "SQLite snapshot persistence to Discord cloud"),
+        "AuditLogs": ("📋 Audit & Message Monitoring", "Audit trail for edited and deleted messages")
     }
 
     for cog_name, cog in sorted(bot.cogs.items()):
@@ -59,7 +60,6 @@ def generate_command_directory_embed(bot: commands.Bot, guild: discord.Guild) ->
             if cmd.hidden:
                 continue
             desc = cmd.help or cmd.description or "Execute command"
-            # Extract first sentence of help string
             first_sentence = desc.split("\n")[0].split(". ")[0].strip()
             if not first_sentence.endswith("."):
                 first_sentence += "."
@@ -90,7 +90,6 @@ async def update_command_channel_panel(bot: commands.Bot, guild: discord.Guild):
             except Exception:
                 channel = None
 
-    # Fallback to channel named bot-commands or commands if ID is unset
     if not channel:
         for c in guild.text_channels:
             if c.name.lower() in ["bot-commands", "commands", "cmd-list", "bot-directives"]:
@@ -129,6 +128,34 @@ async def update_command_channel_panel(bot: commands.Bot, guild: discord.Guild):
             print(f"[PANEL] Created new command directory in #{channel.name}")
     except Exception as e:
         print(f"[PANEL ERROR] Failed updating #{channel.name}: {e}")
+
+
+async def prune_stale_diagnostic_reports(channel: discord.TextChannel, bot_user: discord.ClientUser):
+    """Retains strictly the newest 3 startup/restore report embeds and deletes older ones."""
+    try:
+        startup_messages = []
+        async for msg in channel.history(limit=50):
+            if msg.author == bot_user and msg.embeds:
+                embed_title = msg.embeds[0].title or ""
+                if "Startup Self-Test" in embed_title or "Operational Report" in embed_title:
+                    startup_messages.append(msg)
+
+        startup_messages.sort(key=lambda m: m.created_at, reverse=True)
+        to_delete = startup_messages[KEEP_DIAGNOSTIC_REPORTS_COUNT - 1:]
+
+        for old_msg in to_delete:
+            try:
+                await old_msg.delete()
+                await asyncio.sleep(0.4)
+            except discord.NotFound:
+                pass
+            except Exception as e:
+                print(f"[REPORT PRUNE ERROR] {e}")
+
+        if to_delete:
+            print(f"[CLEANUP] Pruned {len(to_delete)} older diagnostic startup reports from #{channel.name}")
+    except Exception as e:
+        print(f"[REPORT CLEANUP ERROR] {e}")
 
 
 class UtilityBot(commands.Bot):
@@ -427,7 +454,6 @@ class UtilityBot(commands.Bot):
         )
 
         for guild in self.guilds:
-            # Auto-update permanent command panel on startup
             try:
                 await update_command_channel_panel(self, guild)
             except Exception as e:
@@ -436,6 +462,9 @@ class UtilityBot(commands.Bot):
             err_channel = await self.get_or_create_error_log_channel(guild)
             if err_channel:
                 try:
+                    # Prune old diagnostic/restore embeds so strictly the last 3 remain
+                    await prune_stale_diagnostic_reports(err_channel, self.user)
+
                     report_embed, _ = await self.run_diagnostic_suite(guild)
                     await err_channel.send(embed=report_embed)
                 except Exception as e:
@@ -492,10 +521,9 @@ async def instant_sync(ctx: commands.Context):
     try:
         bot.tree.copy_global_to(guild=ctx.guild)
         synced = await bot.tree.sync(guild=ctx.guild)
-        
-        # Refresh the command panel
+
         await update_command_channel_panel(bot, ctx.guild)
-        
+
         await msg.edit(content=f"✅ **Synced {len(synced)} slash commands and updated command roster!**")
     except Exception as e:
         await msg.edit(content=f"❌ Sync failed: `{e}`")
