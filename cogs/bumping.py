@@ -6,10 +6,11 @@ from discord.ext import commands, tasks
 from datetime import datetime, timezone
 import config
 
-BUMP_COOLDOWN_SECONDS = 7200  # 2 Hours
+BUMP_COOLDOWN_SECONDS = 7200       # 2 Hours
+BUMP_PRE_REMINDER_SECONDS = 6300   # 1 Hour 45 Minutes (15 min warning)
 DISBOARD_BOT_ID = 302050872383242240
 BUMP_REWARD_XP = 200
-COOLDOWN_DELETE_DELAY = 10  # Seconds before cooldown message self-destructs
+COOLDOWN_DELETE_DELAY = 10
 
 
 class BumpView(discord.ui.View):
@@ -67,17 +68,16 @@ class Bumping(commands.Cog):
     def cog_unload(self):
         self.bump_reminder_loop.cancel()
 
-    async def get_bump_status(self, guild_id: int) -> tuple[int, int, int, int]:
-        """Returns (last_bump_timestamp, last_bumper_id, reminder_sent, last_channel_id)."""
+    async def get_bump_status(self, guild_id: int) -> tuple[int, int, int, int, int]:
         async with self.bot.db.execute(
-            "SELECT last_bump_timestamp, last_bumper_id, reminder_sent, last_channel_id FROM bump_status WHERE guild_id = ?",
+            "SELECT last_bump_timestamp, last_bumper_id, reminder_sent, last_channel_id, pre_reminder_sent FROM bump_status WHERE guild_id = ?",
             (guild_id,)
         ) as cur:
             row = await cur.fetchone()
 
         if row:
-            return row[0], row[1], row[2], row[3]
-        return 0, 0, 1, 0
+            return row[0], row[1], row[2], row[3], (row[4] if len(row) > 4 else 0)
+        return 0, 0, 1, 0, 1
 
     async def save_bump(self, guild_id: int, user_id: int, channel_id: int):
         now = int(time.time())
@@ -117,7 +117,6 @@ class Bumping(commands.Cog):
         return embed
 
     async def process_successful_bump(self, guild: discord.Guild, member: discord.Member, channel: discord.TextChannel):
-        """Dispatches celebration embed, awards XP, and locks in the new cooldown."""
         async with self.bump_lock:
             await self.save_bump(guild.id, member.id, channel.id)
 
@@ -141,21 +140,17 @@ class Bumping(commands.Cog):
                 embed.set_thumbnail(url=guild.icon.url)
             embed.set_footer(text="Project-Edith • Server Promotion Hub")
 
-            view = BumpView()
-            await channel.send(embed=embed, view=view)
+            await channel.send(embed=embed, view=BumpView())
 
-    # --- Prefix Command: .bump / ;bump ---
     @commands.command(name="bump")
     async def prefix_bump(self, ctx: commands.Context):
-        """Boost server status and earn +200 XP: .bump"""
-        # Delete user command immediately to keep chat clean
         try:
             await ctx.message.delete()
         except Exception:
             pass
 
         now = int(time.time())
-        last_bump, _, _, _ = await self.get_bump_status(ctx.guild.id)
+        last_bump, _, _, _, _ = await self.get_bump_status(ctx.guild.id)
         diff = now - last_bump
 
         if diff < BUMP_COOLDOWN_SECONDS:
@@ -166,17 +161,15 @@ class Bumping(commands.Cog):
 
         await self.process_successful_bump(ctx.guild, ctx.author, ctx.channel)
 
-    # --- Slash Command: /bump ---
     @app_commands.command(name="bump", description="Boost server ranking, lock in next timer, and earn +200 XP.")
     async def slash_bump(self, interaction: discord.Interaction):
         now = int(time.time())
-        last_bump, _, _, _ = await self.get_bump_status(interaction.guild_id)
+        last_bump, _, _, _, _ = await self.get_bump_status(interaction.guild_id)
         diff = now - last_bump
 
         if diff < BUMP_COOLDOWN_SECONDS:
             remaining = BUMP_COOLDOWN_SECONDS - diff
             embed = self.build_cooldown_embed(remaining)
-            # Ephemeral so chat is not cluttered
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
@@ -184,59 +177,80 @@ class Bumping(commands.Cog):
         await self.process_successful_bump(interaction.guild, interaction.user, interaction.channel)
         await interaction.followup.send("✅ Server bump verified and recorded!", ephemeral=True)
 
-    # --- Disboard Bot Bump Detection ---
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        if not message.guild:
+        if not message.guild or message.content.startswith((".", ";")):
             return
 
-        # Crucial: Ignore user command prefixes completely to avoid double triggers
-        if message.content.startswith((".", ";")):
-            return
-
-        # Check if message is from Disboard bot
         if message.author.id == DISBOARD_BOT_ID and message.embeds:
             description = (message.embeds[0].description or "").lower()
-            # Standard Disboard success phrases
             if "bump done" in description or "check it on disboard" in description:
-                # Find bumper from recent chat history
                 bumper = None
                 async for prev_msg in message.channel.history(limit=5, before=message):
-                    if not prev_msg.author.bot and "/bump" in prev_msg.content.lower():
-                        bumper = prev_msg.author
-                        break
-                    elif not prev_msg.author.bot:
+                    if not prev_msg.author.bot:
                         bumper = prev_msg.author
                         break
 
                 target_user = bumper or message.guild.me
                 await self.process_successful_bump(message.guild, target_user, message.channel)
 
-    # --- Scheduled 2-Hour Reminder Loop ---
     @tasks.loop(minutes=1)
     async def bump_reminder_loop(self):
         now = int(time.time())
 
         for guild in self.bot.guilds:
-            last_bump, _, reminder_sent, last_channel_id = await self.get_bump_status(guild.id)
-            if last_bump == 0 or reminder_sent == 1:
+            last_bump, _, reminder_sent, last_channel_id, pre_reminder_sent = await self.get_bump_status(guild.id)
+            if last_bump == 0:
                 continue
 
-            if now - last_bump >= BUMP_COOLDOWN_SECONDS:
-                # Mark reminder sent immediately to block duplicate loops
+            channel = guild.get_channel(last_channel_id) or guild.system_channel
+            if not channel:
+                continue
+
+            role_name = getattr(config, "BUMP_PING_ROLE_NAME", "Bump Pings")
+            role = discord.utils.get(guild.roles, name=role_name)
+            mention_str = role.mention if role else "@here"
+            elapsed = now - last_bump
+
+            # 15-Minute Pre-Reminder
+            if elapsed >= BUMP_PRE_REMINDER_SECONDS and pre_reminder_sent == 0 and elapsed < BUMP_COOLDOWN_SECONDS:
+                await self.bot.db.execute(
+                    "UPDATE bump_status SET pre_reminder_sent = 1 WHERE guild_id = ?",
+                    (guild.id,)
+                )
+                await self.bot.db.commit()
+
+                ready_time = last_bump + BUMP_COOLDOWN_SECONDS
+                embed = discord.Embed(
+                    title="⏳ Bump Window Approaching (15 Minutes)",
+                    description=(
+                        f"Get ready! The server bump window opens in **15 minutes** (<t:{ready_time}:R>).\n\n"
+                        f"Run `.bump` or `/bump` at <t:{ready_time}:t> to claim **+{BUMP_REWARD_XP} XP**!"
+                    ),
+                    color=discord.Color.gold(),
+                    timestamp=datetime.now(timezone.utc)
+                )
+                if guild.icon:
+                    embed.set_thumbnail(url=guild.icon.url)
+                embed.set_footer(text="Project-Edith • Bump Radar")
+
+                try:
+                    await channel.send(
+                        content=f"🔔 {mention_str}",
+                        embed=embed,
+                        view=BumpView(),
+                        allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False)
+                    )
+                except Exception as e:
+                    print(f"[BUMP PRE-REMINDER ERROR] {e}")
+
+            # Final Ready Reminder
+            if elapsed >= BUMP_COOLDOWN_SECONDS and reminder_sent == 0:
                 await self.bot.db.execute(
                     "UPDATE bump_status SET reminder_sent = 1 WHERE guild_id = ?",
                     (guild.id,)
                 )
                 await self.bot.db.commit()
-
-                channel = guild.get_channel(last_channel_id) or guild.system_channel
-                if not channel:
-                    continue
-
-                role_name = getattr(config, "BUMP_PING_ROLE_NAME", "Bump Pings")
-                role = discord.utils.get(guild.roles, name=role_name)
-                mention_str = role.mention if role else "@here"
 
                 embed = discord.Embed(
                     title="⏰ SERVER BUMP READY!",
@@ -251,16 +265,15 @@ class Bumping(commands.Cog):
                     embed.set_thumbnail(url=guild.icon.url)
                 embed.set_footer(text="Project-Edith • Server Promotion Hub")
 
-                view = BumpView()
                 try:
                     await channel.send(
                         content=f"📢 {mention_str}",
                         embed=embed,
-                        view=view,
+                        view=BumpView(),
                         allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False)
                     )
                 except Exception as e:
-                    print(f"[BUMP REMINDER ERROR] Could not dispatch reminder: {e}")
+                    print(f"[BUMP FINAL REMINDER ERROR] {e}")
 
     @bump_reminder_loop.before_loop
     async def before_bump_loop(self):
