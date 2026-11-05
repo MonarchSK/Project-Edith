@@ -17,7 +17,7 @@ class AuditLogs(commands.Cog):
         self.prune_old_audit_logs.cancel()
 
     async def get_or_create_audit_channel(self, guild: discord.Guild) -> discord.TextChannel | None:
-        """Finds or creates an #audit-logs channel inside the 🛠️ BACKUPS & CONTROL category."""
+        """Finds or provisions an #audit-logs channel inside the 🛠️ BACKUPS & CONTROL category."""
         # 1. Check explicit config channel ID
         cfg_id = int(os.getenv("AUDIT_LOGS_CHANNEL_ID", getattr(config, "AUDIT_LOGS_CHANNEL_ID", 0)))
         if cfg_id:
@@ -43,15 +43,25 @@ class AuditLogs(commands.Cog):
             except Exception:
                 target_cat = None
 
-        # 4. Provision channel with secure overwrites
+        # 4. Provision channel with secure role overwrites
         try:
             overwrites = {
                 guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, read_message_history=True, manage_messages=True)
+                guild.me: discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    embed_links=True,
+                    read_message_history=True,
+                    manage_messages=True
+                )
             }
             director_role = discord.utils.get(guild.roles, name=getattr(config, "DIRECTOR_ROLE_NAME", "Director"))
             if director_role:
-                overwrites[director_role] = discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True)
+                overwrites[director_role] = discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=False,
+                    read_message_history=True
+                )
 
             channel = await guild.create_text_channel(
                 name="audit-logs",
@@ -65,6 +75,34 @@ class AuditLogs(commands.Cog):
             print(f"[AUDIT ERROR] Could not provision audit-logs channel: {e}")
             return None
 
+    async def find_deletion_moderator(self, guild: discord.Guild, message: discord.Message) -> discord.Member | None:
+        """Inspects Discord audit logs to identify if a moderator purged the message."""
+        if not guild.me.guild_permissions.view_audit_log:
+            return None
+
+        # Short pause to allow Discord gateway to register the audit log record
+        await asyncio.sleep(0.8)
+
+        now = datetime.now(timezone.utc)
+        try:
+            async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.message_delete):
+                # Ensure the entry matches the target author
+                if entry.target.id != message.author.id:
+                    continue
+
+                # Verify channel context if present in extra metadata
+                if hasattr(entry.extra, "channel") and entry.extra.channel.id != message.channel.id:
+                    continue
+
+                # Match entries triggered within the last 5 seconds to prevent stale associations
+                time_diff = (now - entry.created_at).total_seconds()
+                if abs(time_diff) <= 5.0:
+                    return entry.user
+        except (discord.Forbidden, discord.HTTPException) as e:
+            print(f"[AUDIT LOG FETCH ERROR] {e}")
+
+        return None
+
     # --- Listener: Message Deletions ---
     @commands.Cog.listener()
     async def on_message_delete(self, message: discord.Message):
@@ -72,12 +110,10 @@ class AuditLogs(commands.Cog):
             return
 
         channel = await self.get_or_create_audit_channel(message.guild)
-        if not channel:
+        if not channel or message.channel.id == channel.id:
             return
 
-        # Do not log deletions occurring inside the audit logs channel itself
-        if message.channel.id == channel.id:
-            return
+        deleter = await self.find_deletion_moderator(message.guild, message)
 
         content = message.content.strip() if message.content else "*[No text content]*"
         if len(content) > 1024:
@@ -92,7 +128,12 @@ class AuditLogs(commands.Cog):
         embed.set_author(name=f"{message.author} ({message.author.id})", icon_url=message.author.display_avatar.url)
         embed.add_field(name="📄 Message Content", value=content, inline=False)
 
-        # Attachment tracking
+        # Attribution block
+        if deleter and deleter.id != message.author.id:
+            embed.add_field(name="🛡️ Action Taken By", value=f"{deleter.mention} (`{deleter.id}`)", inline=True)
+        else:
+            embed.add_field(name="🛡️ Action Taken By", value=f"{message.author.mention} *(Self-deletion / Unlogged)*", inline=True)
+
         if message.attachments:
             att_list = [f"• [`{att.filename}`]({att.url}) ({round(att.size / 1024, 1)} KB)" for att in message.attachments]
             embed.add_field(name=f"📎 Attachments ({len(message.attachments)})", value="\n".join(att_list[:5]), inline=False)
@@ -110,15 +151,12 @@ class AuditLogs(commands.Cog):
         if before.author.bot or not before.guild:
             return
 
-        # Ignore embeds loading, pinned state changes, or identical content
+        # Skip pinned state mutations, embeds auto-loading, or identical content
         if before.content == after.content:
             return
 
         channel = await self.get_or_create_audit_channel(before.guild)
-        if not channel:
-            return
-
-        if before.channel.id == channel.id:
+        if not channel or before.channel.id == channel.id:
             return
 
         before_content = before.content.strip() if before.content else "*[Empty]*"
@@ -148,7 +186,7 @@ class AuditLogs(commands.Cog):
     # --- Task: Auto-Delete Audit Logs Older Than 3 Days ---
     @tasks.loop(hours=2)
     async def prune_old_audit_logs(self):
-        """Purges messages in the audit-logs channel older than 3 days."""
+        """Purges messages in the audit-logs channel older than the retention threshold."""
         cutoff_date = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
 
         for guild in self.bot.guilds:
@@ -158,7 +196,6 @@ class AuditLogs(commands.Cog):
 
             try:
                 deleted_count = 0
-                # Bulk purge messages older than cutoff but younger than 14 days
                 async for msg in channel.history(limit=200):
                     if msg.created_at < cutoff_date:
                         try:
@@ -171,7 +208,7 @@ class AuditLogs(commands.Cog):
                             pass
 
                 if deleted_count > 0:
-                    print(f"[AUDIT RETENTION] Purged {deleted_count} messages older than {RETENTION_DAYS} days in #{channel.name}")
+                    print(f"[AUDIT RETENTION] Purged {deleted_count} records older than {RETENTION_DAYS} days in #{channel.name}")
             except Exception as e:
                 print(f"[AUDIT PURGE ERROR] {e}")
 
