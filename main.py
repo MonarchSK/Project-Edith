@@ -81,57 +81,103 @@ def generate_command_directory_embed(bot: commands.Bot, guild: discord.Guild) ->
     return embed
 
 
-async def update_command_channel_panel(bot: commands.Bot, guild: discord.Guild):
-    """Finds or creates a permanent command panel in the designated commands channel and edits it in-place."""
+async def resolve_or_create_commands_channel(guild: discord.Guild) -> discord.TextChannel | None:
+    """Finds by ID, finds by fuzzy name match, or automatically provisions a #bot-commands channel."""
+    # 1. Check explicit ID from config or environment variable
     channel_id = int(os.getenv("COMMANDS_CHANNEL_ID", getattr(config, "COMMANDS_CHANNEL_ID", 0)))
-    channel = None
-
     if channel_id and channel_id != 0:
-        channel = guild.get_channel(channel_id)
-        if not channel:
-            try:
-                channel = await guild.fetch_channel(channel_id)
-            except Exception:
-                channel = None
+        chan = guild.get_channel(channel_id)
+        if chan:
+            return chan
+        try:
+            return await guild.fetch_channel(channel_id)
+        except Exception:
+            pass
 
-    if not channel:
-        for c in guild.text_channels:
-            if c.name.lower() in ["bot-commands", "commands", "cmd-list", "bot-directives"]:
-                channel = c
-                break
+    # 2. Fuzzy name matching across existing text channels
+    candidates = [
+        "bot-commands", "commands", "bot-cmd", "bot-directives", 
+        "cmd-list", "bot-spam", "terminal", "directives"
+    ]
+    for c in guild.text_channels:
+        lower_name = c.name.lower()
+        if any(term in lower_name for term in candidates):
+            return c
 
+    # 3. Fallback: Auto-provision #bot-commands under general or control category
+    target_category = None
+    for cat in guild.categories:
+        if any(keyword in cat.name.upper() for keyword in ["BACKUP", "CONTROL", "BOT", "SYSTEM", "GENERAL"]):
+            target_category = cat
+            break
+
+    try:
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, manage_messages=True)
+        }
+        channel = await guild.create_text_channel(
+            name="bot-commands",
+            category=target_category,
+            overwrites=overwrites,
+            topic="Official bot commands hub. Dynamic command matrix updates here automatically."
+        )
+        print(f"[AUTO-CHANNEL] Provisioned #{channel.name} in {guild.name}")
+        return channel
+    except Exception as e:
+        print(f"[AUTO-CHANNEL ERROR] Could not auto-create #bot-commands in {guild.name}: {e}")
+        return None
+
+
+async def update_command_channel_panel(bot: commands.Bot, guild: discord.Guild) -> tuple[bool, str]:
+    """Finds or creates a permanent command panel in the designated commands channel and edits it in-place."""
+    channel = await resolve_or_create_commands_channel(guild)
     if not channel:
-        return
+        return False, "Could not find or automatically create a commands text channel."
 
     perms = channel.permissions_for(guild.me)
     if not perms.send_messages or not perms.embed_links:
-        print(f"[PANEL WARNING] Missing send/embed permissions in #{channel.name}")
-        return
+        return False, f"Missing Send Messages or Embed Links permissions in #{channel.name}."
 
     embed = generate_command_directory_embed(bot, guild)
 
     try:
         target_msg = None
-        async for msg in channel.history(limit=30):
-            if msg.author == bot.user and msg.embeds:
-                title = msg.embeds[0].title or ""
-                if "Active Command Roster" in title or "Command Matrix" in title:
-                    target_msg = msg
-                    break
+
+        # Check pinned messages first
+        try:
+            pins = await channel.pins()
+            for p in pins:
+                if p.author == bot.user and p.embeds:
+                    title = p.embeds[0].title or ""
+                    if any(term in title for term in ["Active Command Roster", "Command Matrix", "Command Roster"]):
+                        target_msg = p
+                        break
+        except Exception:
+            pass
+
+        # If not pinned, check recent history
+        if not target_msg:
+            async for msg in channel.history(limit=50):
+                if msg.author == bot.user and msg.embeds:
+                    title = msg.embeds[0].title or ""
+                    if any(term in title for term in ["Active Command Roster", "Command Matrix", "Command Roster"]):
+                        target_msg = msg
+                        break
 
         if target_msg:
             await target_msg.edit(embed=embed)
-            print(f"[PANEL] Updated active command directory in #{channel.name}")
+            return True, f"Successfully edited existing command panel in #{channel.name} (ID: `{target_msg.id}`)."
         else:
             new_msg = await channel.send(embed=embed)
-            try:
-                if perms.manage_messages:
+            if perms.manage_messages:
+                try:
                     await new_msg.pin(reason="Persistent Command Roster")
-            except Exception:
-                pass
-            print(f"[PANEL] Created new command directory in #{channel.name}")
+                except Exception:
+                    pass
+            return True, f"Created and pinned a fresh command panel in #{channel.name} (ID: `{new_msg.id}`)."
     except Exception as e:
-        print(f"[PANEL ERROR] Failed updating #{channel.name}: {e}")
+        return False, f"Error updating #{channel.name}: {e}"
 
 
 async def prune_stale_diagnostic_reports(channel: discord.TextChannel, bot_user: discord.ClientUser):
@@ -461,7 +507,8 @@ class UtilityBot(commands.Bot):
 
         for guild in self.guilds:
             try:
-                await update_command_channel_panel(self, guild)
+                success, msg = await update_command_channel_panel(self, guild)
+                print(f"[AUTO-PANEL in {guild.name}] {msg}")
             except Exception as e:
                 print(f"[AUTO-PANEL ERROR in {guild.name}] {e}")
 
@@ -517,6 +564,18 @@ class UtilityBot(commands.Bot):
 bot = UtilityBot()
 
 
+@bot.command(name="updatepanel", aliases=["refreshpanel", "fixpanel"])
+@commands.has_permissions(administrator=True)
+async def manual_update_panel(ctx: commands.Context):
+    """Forces an immediate refresh of the command directory in the bot commands channel."""
+    msg = await ctx.send("⏳ Locating commands channel and refreshing panel...")
+    success, detail = await update_command_channel_panel(bot, ctx.guild)
+    if success:
+        await msg.edit(content=f"✅ **Panel Updated:** {detail}")
+    else:
+        await msg.edit(content=f"❌ **Panel Update Failed:** {detail}")
+
+
 @bot.command(name="sync")
 @commands.has_permissions(administrator=True)
 async def instant_sync(ctx: commands.Context):
@@ -526,9 +585,15 @@ async def instant_sync(ctx: commands.Context):
         bot.tree.copy_global_to(guild=ctx.guild)
         synced = await bot.tree.sync(guild=ctx.guild)
 
-        await update_command_channel_panel(bot, ctx.guild)
+        success, detail = await update_command_channel_panel(bot, ctx.guild)
 
-        await msg.edit(content=f"✅ **Synced {len(synced)} slash commands and updated command roster!**")
+        status_text = f"✅ **Synced {len(synced)} slash commands!**"
+        if success:
+            status_text += f"\n📋 **Directory:** {detail}"
+        else:
+            status_text += f"\n⚠️ **Directory Warning:** {detail}"
+
+        await msg.edit(content=status_text)
     except Exception as e:
         await msg.edit(content=f"❌ Sync failed: `{e}`")
 
