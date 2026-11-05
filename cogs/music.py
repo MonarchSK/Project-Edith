@@ -10,6 +10,37 @@ from discord.ext import commands
 import yt_dlp
 import imageio_ffmpeg
 
+# Explicitly ensure Opus is loaded into memory using custom/system paths
+def initialize_opus():
+    if discord.opus.is_loaded():
+        return True
+
+    opus_candidates = [
+        os.path.join(os.getcwd(), "lib", "libopus.so"),
+        os.path.join(os.getcwd(), "libopus.so"),
+        "libopus.so.0",
+        "libopus.so",
+        "/usr/lib/x86_64-linux-gnu/libopus.so.0",
+        "/usr/lib/libopus.so.0",
+        "/usr/local/lib/libopus.so"
+    ]
+
+    for path in opus_candidates:
+        if os.path.exists(path) or not path.startswith("/"):
+            try:
+                discord.opus.load_opus(path)
+                if discord.opus.is_loaded():
+                    print(f"[VOICE INIT] Successfully loaded Opus library from: {path}")
+                    return True
+            except Exception:
+                continue
+
+    print("[VOICE WARNING] Could not bind Opus library. Audio transmission will fail.")
+    return False
+
+OPUS_INITIALIZED = initialize_opus()
+
+
 def resolve_ffmpeg_binary() -> str:
     """Discovers and guarantees executable permissions on the static FFmpeg binary."""
     try:
@@ -212,7 +243,6 @@ class GuildMusicState:
 
             self.current_song = self.queue.popleft()
 
-            # Ensure direct stream URL is fresh before sending to FFmpeg
             stream_url = self.current_song.stream_url
             if not stream_url or "manifest" in stream_url:
                 try:
@@ -332,19 +362,35 @@ class Music(commands.Cog):
 
     @commands.command(name="testaudio")
     async def test_audio(self, ctx: commands.Context):
-        """Streams a raw direct MP3 file to verify whether FFmpeg and voice routing work."""
+        """Streams a raw direct MP3 file and outputs detailed voice pipe diagnostics."""
         vc = await self.ensure_voice_connection(ctx)
         if not vc:
             return
 
-        msg = await ctx.send(f"🔍 Testing system audio pipeline...\n• **FFmpeg Binary:** `{FFMPEG_EXECUTABLE}`\n• **Voice Gateway:** Connected")
+        if not discord.opus.is_loaded():
+            initialize_opus()
+
+        opus_status = discord.opus.is_loaded()
+        msg = await ctx.send(
+            f"🔍 **Audio Pipeline Telemetry:**\n"
+            f"• **FFmpeg Executable:** `{FFMPEG_EXECUTABLE}`\n"
+            f"• **Opus Loaded:** `{'✅ YES' if opus_status else '❌ NO (Voice will be silent)'}`\n"
+            f"• **Voice Protocol:** `PyNaCl`\n"
+            f"• **Connection:** `{vc.endpoint if hasattr(vc, 'endpoint') else 'Connected'}`"
+        )
+
         test_url = "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"
         try:
             raw_source = discord.FFmpegPCMAudio(test_url, executable=FFMPEG_EXECUTABLE, **FFMPEG_OPTIONS)
             source = discord.PCMVolumeTransformer(raw_source, volume=0.8)
+
+            def after_test(err):
+                if err:
+                    print(f"[TESTAUDIO ERROR] {err}")
+
             vc.stop()
-            vc.play(source)
-            await msg.edit(content=f"🔊 **Now playing raw MP3 stream.**\nIf you hear sound, FFmpeg and PyNaCl are functional.")
+            vc.play(source, after=after_test)
+            await ctx.send("🔊 **Streaming test audio.** If Opus is loaded and working, you should now hear piano audio and see the green indicator.")
         except Exception as e:
             await msg.edit(content=f"❌ **Direct audio pipeline failed:** `{e}`")
 
