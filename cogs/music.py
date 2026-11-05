@@ -1,3 +1,5 @@
+import os
+import shutil
 import asyncio
 import collections
 import random
@@ -6,8 +8,9 @@ from discord import app_commands
 from discord.ext import commands
 import yt_dlp
 
-# Suppress noisy ytdl bug reports
-yt_dlp.utils.bug_reports_message = lambda: ''
+# Verify voice support dependencies
+VOICE_SUPPORT_AVAILABLE = discord.opus.is_loaded() or hasattr(discord, "VoiceClient")
+FFMPEG_EXECUTABLE = shutil.which("ffmpeg") or "ffmpeg"
 
 YTDL_FORMAT_OPTIONS = {
     'format': 'bestaudio/best',
@@ -20,7 +23,7 @@ YTDL_FORMAT_OPTIONS = {
     'quiet': True,
     'no_warnings': True,
     'default_search': 'ytsearch',
-    'source_address': '0.0.0.0',  # bind to ipv4 since ipv6 addresses often get ratelimited
+    'source_address': '0.0.0.0',
 }
 
 FFMPEG_OPTIONS = {
@@ -32,7 +35,6 @@ ytdl = yt_dlp.YoutubeDL(YTDL_FORMAT_OPTIONS)
 
 
 class Song:
-    """Represents a song item in the player queue."""
     def __init__(self, data: dict, requester: discord.Member):
         self.data = data
         self.requester = requester
@@ -48,6 +50,8 @@ class Song:
         loop = loop or asyncio.get_event_loop()
         data = await loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=False))
         if 'entries' in data:
+            if not data['entries']:
+                raise ValueError("No matching audio found.")
             data = data['entries'][0]
         return cls(data, requester)
 
@@ -62,7 +66,6 @@ class Song:
 
 
 class MusicPlayerControllerView(discord.ui.View):
-    """AtomMusic-inspired interactive controller attached to the active player embed."""
     def __init__(self, guild_music_state):
         super().__init__(timeout=None)
         self.state = guild_music_state
@@ -77,7 +80,8 @@ class MusicPlayerControllerView(discord.ui.View):
         if self.state.current_song:
             self.state.queue.appendleft(self.state.current_song)
         self.state.queue.appendleft(prev_song)
-        self.state.voice_client.stop()
+        if self.state.voice_client:
+            self.state.voice_client.stop()
         await interaction.response.send_message("⏮️ Returning to previous track.", ephemeral=True)
 
     @discord.ui.button(emoji="⏯️", style=discord.ButtonStyle.primary, custom_id="btn_music_pause_resume")
@@ -130,7 +134,6 @@ class MusicPlayerControllerView(discord.ui.View):
 
 
 class GuildMusicState:
-    """Manages audio queue state, player loops, and controller messages per server."""
     def __init__(self, bot, guild: discord.Guild):
         self.bot = bot
         self.guild = guild
@@ -148,7 +151,6 @@ class GuildMusicState:
         while not self.bot.is_closed():
             self.play_next_song.clear()
 
-            # Wait for tracks or disconnect if idle for 3 minutes
             if not self.queue:
                 try:
                     await asyncio.wait_for(self._wait_for_queue(), timeout=180.0)
@@ -162,12 +164,23 @@ class GuildMusicState:
                             pass
                     break
 
+            if not self.queue:
+                continue
+
             self.current_song = self.queue.popleft()
-            source = discord.FFmpegPCMAudio(self.current_song.stream_url, **FFMPEG_OPTIONS)
+            try:
+                source = discord.FFmpegPCMAudio(
+                    self.current_song.stream_url,
+                    executable=FFMPEG_EXECUTABLE,
+                    **FFMPEG_OPTIONS
+                )
+            except Exception as e:
+                print(f"[FFMPEG INITIALIZATION ERROR] {e}")
+                continue
 
             def after_playback(err):
                 if err:
-                    print(f"[AUDIO ERROR] {err}")
+                    print(f"[AUDIO RUNTIME ERROR] {err}")
                 self.bot.loop.call_soon_threadsafe(self.play_next_song.set)
 
             if not self.voice_client or not self.voice_client.is_connected():
@@ -176,7 +189,6 @@ class GuildMusicState:
             self.voice_client.play(source, after=after_playback)
             await self.update_controller_ui()
 
-            # Wait until the track completes before pulling next item
             await self.play_next_song.wait()
             if self.current_song:
                 self.history.append(self.current_song)
@@ -201,10 +213,9 @@ class GuildMusicState:
         embed.add_field(name="Duration", value=f"`{self.current_song.format_duration()}`", inline=True)
         embed.add_field(name="Requested By", value=self.current_song.requester.mention, inline=True)
 
-        # Queue overview snippet
         if self.queue:
             next_up = list(self.queue)[:3]
-            lines = [f"`{idx+1}.` [{s.title[:40]}]({s.url}) (`{s.format_duration()}`)" for idx, s in enumerate(next_up)]
+            lines = [f"`{idx+1}.` [{s.title[:38]}]({s.url}) (`{s.format_duration()}`)" for idx, s in enumerate(next_up)]
             remaining = len(self.queue) - len(next_up)
             queue_str = "\n".join(lines)
             if remaining > 0:
@@ -214,11 +225,8 @@ class GuildMusicState:
             embed.add_field(name="📑 Next In Queue", value="*Queue empty — add more songs!*", inline=False)
 
         embed.set_footer(text="Project-Edith • AtomMusic Controller System")
-
         view = MusicPlayerControllerView(self)
 
-        # Re-post or edit the existing dashboard controller
-        target_channel = getattr(self.current_song.requester, "voice", None)
         if self.current_message:
             try:
                 await self.current_message.edit(embed=embed, view=view)
@@ -226,10 +234,12 @@ class GuildMusicState:
             except Exception:
                 pass
 
-        if target_channel and hasattr(target_channel.channel, "guild"):
-            # Post controller into standard text channel
-            text_channel = self.current_song.requester.guild.system_channel or self.current_song.requester.guild.text_channels[0]
-            self.current_message = await text_channel.send(embed=embed, view=view)
+        text_channel = self.current_song.requester.guild.system_channel or self.current_song.requester.guild.text_channels[0]
+        if text_channel:
+            try:
+                self.current_message = await text_channel.send(embed=embed, view=view)
+            except Exception:
+                pass
 
 
 class Music(commands.Cog):
@@ -263,7 +273,6 @@ class Music(commands.Cog):
 
         return vc
 
-    # --- Slash Directive: /play [query] ---
     @app_commands.command(name="play", description="Play a track or add it to the AtomMusic player queue.")
     @app_commands.describe(query="Song title, artist name, or YouTube/SoundCloud URL")
     async def slash_play(self, interaction: discord.Interaction, query: str):
@@ -295,7 +304,6 @@ class Music(commands.Cog):
         else:
             await interaction.followup.send(f"▶️ Loaded **{song.title}** into the audio controller.", ephemeral=True)
 
-    # --- Prefix Directive: .play / ;play [query] ---
     @commands.command(name="play", aliases=["p"])
     async def prefix_play(self, ctx: commands.Context, *, query: str):
         """Play a track or add to queue: .play Alan Walker Faded"""
@@ -329,7 +337,6 @@ class Music(commands.Cog):
                 embed.set_thumbnail(url=song.thumbnail)
             await ctx.send(embed=embed, delete_after=10)
 
-    # --- Queue Command ---
     @commands.command(name="queue", aliases=["q"])
     async def prefix_queue(self, ctx: commands.Context):
         """View the current playback queue."""
