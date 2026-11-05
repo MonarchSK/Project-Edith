@@ -10,7 +10,7 @@ from discord.ext import commands
 import yt_dlp
 import imageio_ffmpeg
 
-# Explicitly ensure Opus is loaded into memory using custom/system paths
+# Explicitly ensure Opus is loaded into memory using custom or system paths
 def initialize_opus():
     if discord.opus.is_loaded():
         return True
@@ -90,7 +90,7 @@ YTDL_OPTIONS = {
 
 FFMPEG_OPTIONS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin',
-    'options': '-vn -b:a 128k',
+    'options': '-vn -f s16le -ar 48000 -ac 2 -b:a 128k',
 }
 
 
@@ -354,7 +354,7 @@ class Music(commands.Cog):
         target_channel = user.voice.channel
 
         if vc is None:
-            vc = await target_channel.connect(timeout=15.0)
+            vc = await target_channel.connect(timeout=15.0, self_deaf=True)
         elif vc.channel != target_channel:
             await vc.move_to(target_channel)
 
@@ -375,8 +375,7 @@ class Music(commands.Cog):
             f"🔍 **Audio Pipeline Telemetry:**\n"
             f"• **FFmpeg Executable:** `{FFMPEG_EXECUTABLE}`\n"
             f"• **Opus Loaded:** `{'✅ YES' if opus_status else '❌ NO (Voice will be silent)'}`\n"
-            f"• **Voice Protocol:** `PyNaCl`\n"
-            f"• **Connection:** `{vc.endpoint if hasattr(vc, 'endpoint') else 'Connected'}`"
+            f"• **Connection:** `{getattr(vc, 'endpoint', 'Connected')}`"
         )
 
         test_url = "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"
@@ -390,7 +389,12 @@ class Music(commands.Cog):
 
             vc.stop()
             vc.play(source, after=after_test)
-            await ctx.send("🔊 **Streaming test audio.** If Opus is loaded and working, you should now hear piano audio and see the green indicator.")
+            
+            await asyncio.sleep(2)
+            if vc.is_playing():
+                await ctx.send("🔊 **Streaming test audio:** Packets are transmitting to the gateway.")
+            else:
+                await ctx.send("⚠️ **Playback stopped immediately.** Check container logs for voice encryption errors.")
         except Exception as e:
             await msg.edit(content=f"❌ **Direct audio pipeline failed:** `{e}`")
 
