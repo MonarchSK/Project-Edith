@@ -10,18 +10,8 @@ import yt_dlp
 
 FFMPEG_EXECUTABLE = shutil.which("ffmpeg") or "ffmpeg"
 
-# If raw cookies are injected via Render environment variable, write them to disk
-COOKIE_FILE_PATH = "cookies.txt"
-env_cookies = os.getenv("YOUTUBE_COOKIES")
-if env_cookies and not os.path.exists(COOKIE_FILE_PATH):
-    try:
-        with open(COOKIE_FILE_PATH, "w", encoding="utf-8") as f:
-            f.write(env_cookies.strip())
-        print("[MUSIC AUTH] Successfully created cookies.txt from environment.")
-    except Exception as e:
-        print(f"[MUSIC AUTH WARNING] Could not write cookies.txt: {e}")
-
-YTDL_BASE_OPTIONS = {
+# Native SoundCloud / Direct Stream Options (No cookies required)
+YTDL_OPTIONS = {
     'format': 'bestaudio/best',
     'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
     'restrictfilenames': True,
@@ -31,22 +21,9 @@ YTDL_BASE_OPTIONS = {
     'logtostderr': False,
     'quiet': True,
     'no_warnings': True,
+    'default_search': 'scsearch',  # Defaults to SoundCloud search
     'source_address': '0.0.0.0',
-    # Emulate mobile and TV clients to bypass web bot verification walls
-    'extractor_args': {
-        'youtube': {
-            'player_client': ['ios', 'android', 'tvhtml5', 'mweb'],
-            'player_skip': ['webpage', 'configs'],
-        }
-    },
-    'http_headers': {
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
-        'Accept-Language': 'en-US,en;q=0.9',
-    }
 }
-
-if os.path.exists(COOKIE_FILE_PATH):
-    YTDL_BASE_OPTIONS['cookiefile'] = COOKIE_FILE_PATH
 
 FFMPEG_OPTIONS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
@@ -63,35 +40,29 @@ class Song:
         self.stream_url = data.get('url', '')
         self.duration = data.get('duration', 0)
         self.thumbnail = data.get('thumbnail', None)
-        self.uploader = data.get('uploader', 'Unknown Artist')
+        self.uploader = data.get('uploader', 'SoundCloud Artist')
 
     @classmethod
     async def from_query(cls, query: str, requester: discord.Member, loop=None):
         loop = loop or asyncio.get_event_loop()
 
-        def extract(search_term: str):
-            # Attempt YouTube resolution first with mobile client headers
-            ydl_opts = dict(YTDL_BASE_OPTIONS)
-            ydl_opts['default_search'] = 'ytsearch'
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                try:
-                    return ydl.extract_info(search_term, download=False)
-                except Exception as yt_err:
-                    err_msg = str(yt_err).lower()
-                    # Fallback to SoundCloud if YouTube blocks or challenges datacenter IP
-                    if "confirm you’re not a bot" in err_msg or "sign in" in err_msg or "http error 429" in err_msg:
-                        print(f"[YTDL FALLBACK] YouTube bot check triggered. Retrying on SoundCloud: {search_term}")
-                        ydl_sc_opts = dict(YTDL_BASE_OPTIONS)
-                        ydl_sc_opts['default_search'] = 'scsearch'
-                        with yt_dlp.YoutubeDL(ydl_sc_opts) as sc_ydl:
-                            return sc_ydl.extract_info(search_term, download=False)
-                    raise yt_err
+        def extract():
+            # If the user provides a direct link (Bandcamp, SoundCloud, direct audio URL), stream directly.
+            # If plain text, search SoundCloud without touching YouTube bot gates.
+            ydl_opts = dict(YTDL_OPTIONS)
+            if not query.startswith(("http://", "https://")):
+                search_query = f"scsearch:{query}"
+            else:
+                search_query = query
 
-        data = await loop.run_in_executor(None, lambda: extract(query))
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(search_query, download=False)
+
+        data = await loop.run_in_executor(None, extract)
 
         if 'entries' in data:
             if not data['entries']:
-                raise ValueError("No matching audio track could be located.")
+                raise ValueError("No matching audio track could be found.")
             data = data['entries'][0]
 
         return cls(data, requester)
@@ -99,7 +70,7 @@ class Song:
     def format_duration(self) -> str:
         if not self.duration:
             return "🔴 Live Stream"
-        mins, secs = divmod(self.duration, 60)
+        mins, secs = divmod(int(self.duration), 60)
         hours, mins = divmod(mins, 60)
         if hours > 0:
             return f"{hours:d}:{mins:02d}:{secs:02d}"
@@ -250,7 +221,7 @@ class GuildMusicState:
         if self.current_song.thumbnail:
             embed.set_thumbnail(url=self.current_song.thumbnail)
 
-        embed.add_field(name="Channel / Artist", value=f"`{self.current_song.uploader}`", inline=True)
+        embed.add_field(name="Source / Platform", value=f"`SoundCloud / Direct`", inline=True)
         embed.add_field(name="Duration", value=f"`{self.current_song.format_duration()}`", inline=True)
         embed.add_field(name="Requested By", value=self.current_song.requester.mention, inline=True)
 
@@ -315,7 +286,7 @@ class Music(commands.Cog):
         return vc
 
     @app_commands.command(name="play", description="Play a track or add it to the AtomMusic player queue.")
-    @app_commands.describe(query="Song title, artist name, or direct URL")
+    @app_commands.describe(query="Song title, artist name, or SoundCloud/direct link")
     async def slash_play(self, interaction: discord.Interaction, query: str):
         vc = await self.ensure_voice_connection(interaction)
         if not vc:
@@ -347,7 +318,7 @@ class Music(commands.Cog):
 
     @commands.command(name="play", aliases=["p"])
     async def prefix_play(self, ctx: commands.Context, *, query: str):
-        """Play a track or add to queue: .play Alan Walker Faded"""
+        """Play a track: .play Alan Walker Faded"""
         vc = await self.ensure_voice_connection(ctx)
         if not vc:
             return
@@ -355,7 +326,7 @@ class Music(commands.Cog):
         state = self.get_music_state(ctx.guild)
         state.voice_client = vc
 
-        load_msg = await ctx.send("🔍 *Searching audio streams...*")
+        load_msg = await ctx.send("🔍 *Searching stream tracks...*")
         try:
             song = await Song.from_query(query, requester=ctx.author, loop=self.bot.loop)
         except Exception as e:
