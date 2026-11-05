@@ -6,7 +6,6 @@ from discord import app_commands
 from discord.ext import commands
 from datetime import datetime, timezone
 
-# 15+ Distinct Built-In Custom AFK Status Presets
 DEFAULT_AFK_PRESETS = [
     "Busy studying & cramming for exams 📚",
     "Grinding ranked games — do not disturb 🎮",
@@ -32,13 +31,12 @@ AFK_CONFIRM_DISAPPEAR_SECONDS = 10
 class AFK(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.recently_set = set()
+        self.recently_set_users = set()
 
     async def set_user_afk(self, guild: discord.Guild, member: discord.Member, reason: str) -> discord.Embed:
         now = int(time.time())
         original_nick = member.nick
 
-        # Save record to SQLite
         await self.bot.db.execute("""
             INSERT INTO afk_users (user_id, guild_id, reason, timestamp, original_nickname)
             VALUES (?, ?, ?, ?, ?)
@@ -50,12 +48,10 @@ class AFK(commands.Cog):
         """, (member.id, guild.id, reason, now, original_nick))
         await self.bot.db.commit()
 
-        # Mark cloud backup dirty
         backup_cog = self.bot.get_cog("DiscordMemoryBackup")
         if backup_cog and hasattr(backup_cog, "mark_dirty"):
             backup_cog.mark_dirty(reason="User AFK Status Registered")
 
-        # Update member display name with [AFK] prefix
         try:
             current_name = member.display_name
             if not current_name.startswith("[AFK] "):
@@ -69,7 +65,7 @@ class AFK(commands.Cog):
             description=(
                 f"{member.mention} is now marked as **AFK**.\n\n"
                 f"💬 **Message:**\n> *\"{reason}\"*\n\n"
-                f"⏳ *This notice will disappear in **{AFK_CONFIRM_DISAPPEAR_SECONDS}** seconds.*"
+                f"⏳ *Notice auto-destructs in **{AFK_CONFIRM_DISAPPEAR_SECONDS}** seconds.*"
             ),
             color=discord.Color.from_rgb(114, 137, 218),
             timestamp=datetime.now(timezone.utc)
@@ -86,33 +82,28 @@ class AFK(commands.Cog):
         ]
         return choices[:25]
 
-    # --- Prefix Command: .afk [reason] or ;afk [reason] ---
     @commands.command(name="afk")
     async def prefix_afk(self, ctx: commands.Context, *, reason: str = None):
-        """Set your AFK status with auto-deleting confirmation: .afk studying"""
+        """Set your AFK status: .afk or .afk studying"""
         final_reason = reason.strip() if reason else random.choice(DEFAULT_AFK_PRESETS)
-        self.recently_set.add(ctx.author.id)
+        self.recently_set_users.add(ctx.author.id)
 
-        # Delete the trigger command (.afk ...) so chat stays clean
         try:
             await ctx.message.delete()
         except Exception:
             pass
 
         embed = await self.set_user_afk(ctx.guild, ctx.author, final_reason)
-        # Disappear automatically after 10 seconds
         await ctx.send(embed=embed, delete_after=AFK_CONFIRM_DISAPPEAR_SECONDS)
 
-    # --- Slash Command: /afk [message] ---
     @app_commands.command(name="afk", description="Set your AFK status with a custom message or preset.")
     @app_commands.describe(message="Choose a preset or type your own custom away message")
     @app_commands.autocomplete(message=afk_preset_autocomplete)
     async def slash_afk(self, interaction: discord.Interaction, message: str = None):
         final_reason = message.strip() if message else random.choice(DEFAULT_AFK_PRESETS)
-        self.recently_set.add(interaction.user.id)
+        self.recently_set_users.add(interaction.user.id)
         embed = await self.set_user_afk(interaction.guild, interaction.user, final_reason)
-        
-        # Post confirmation to channel that self-destructs in 10 seconds
+
         await interaction.response.send_message(embed=embed)
         await asyncio.sleep(AFK_CONFIRM_DISAPPEAR_SECONDS)
         try:
@@ -125,13 +116,13 @@ class AFK(commands.Cog):
         if message.author.bot or not message.guild:
             return
 
-        # Crucial Fix: Skip command messages entirely so .afk or ;afk doesn't trigger on_message
+        # Block any command execution from triggering AFK listeners
         if message.content.startswith((".", ";")):
             return
 
-        # 1. Clear AFK status when the member talks
-        if message.author.id in self.recently_set:
-            self.recently_set.remove(message.author.id)
+        # 1. Clear AFK status when the user speaks in chat
+        if message.author.id in self.recently_set_users:
+            self.recently_set_users.remove(message.author.id)
         else:
             async with self.bot.db.execute(
                 "SELECT reason, timestamp, original_nickname FROM afk_users WHERE user_id = ?",
@@ -144,7 +135,6 @@ class AFK(commands.Cog):
                 await self.bot.db.execute("DELETE FROM afk_users WHERE user_id = ?", (message.author.id,))
                 await self.bot.db.commit()
 
-                # Restore original nickname
                 try:
                     await message.author.edit(nick=original_nick, reason="User returned from AFK")
                 except discord.Forbidden:
@@ -161,7 +151,7 @@ class AFK(commands.Cog):
                 )
                 await message.channel.send(embed=embed, delete_after=AFK_CONFIRM_DISAPPEAR_SECONDS)
 
-        # 2. Inform users who mention an AFK member
+        # 2. Alert users who mention an AFK member
         if message.mentions:
             for mentioned in message.mentions:
                 if mentioned.id == message.author.id or mentioned.bot:
