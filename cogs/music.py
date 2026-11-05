@@ -1,4 +1,5 @@
 import os
+import stat
 import shutil
 import asyncio
 import collections
@@ -7,19 +8,34 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import yt_dlp
+import imageio_ffmpeg
 
-# Discover FFmpeg path across Render environment variations
 def resolve_ffmpeg_binary() -> str:
+    """Discovers and guarantees executable permissions on the static FFmpeg binary."""
+    try:
+        binary_path = imageio_ffmpeg.get_ffmpeg_exe()
+        if os.path.exists(binary_path):
+            current_perms = os.stat(binary_path).st_mode
+            os.chmod(binary_path, current_perms | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            return binary_path
+    except Exception as e:
+        print(f"[FFMPEG DISCOVERY WARNING] imageio_ffmpeg path failed: {e}")
+
     candidates = [
         shutil.which("ffmpeg"),
-        "/usr/bin/ffmpeg",
-        "/usr/local/bin/ffmpeg",
         os.path.join(os.getcwd(), "bin", "ffmpeg"),
-        "/opt/render/project/src/bin/ffmpeg"
+        "/usr/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg"
     ]
     for path in candidates:
-        if path and os.path.exists(path) and os.access(path, os.X_OK):
+        if path and os.path.exists(path):
+            try:
+                current_perms = os.stat(path).st_mode
+                os.chmod(path, current_perms | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            except Exception:
+                pass
             return path
+
     return "ffmpeg"
 
 FFMPEG_EXECUTABLE = resolve_ffmpeg_binary()
@@ -196,7 +212,7 @@ class GuildMusicState:
 
             self.current_song = self.queue.popleft()
 
-            # Refresh tokenized stream URL immediately prior to starting playback
+            # Ensure direct stream URL is fresh before sending to FFmpeg
             stream_url = self.current_song.stream_url
             if not stream_url or "manifest" in stream_url:
                 try:
@@ -316,7 +332,7 @@ class Music(commands.Cog):
 
     @commands.command(name="testaudio")
     async def test_audio(self, ctx: commands.Context):
-        """Plays an unblocked direct audio sample to test FFmpeg and voice routing."""
+        """Streams a raw direct MP3 file to verify whether FFmpeg and voice routing work."""
         vc = await self.ensure_voice_connection(ctx)
         if not vc:
             return
