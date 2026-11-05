@@ -44,15 +44,36 @@ class DiscordMemoryBackup(commands.Cog):
         src.close()
         return temp
 
-    async def prune_stale_backups(self, channel: discord.TextChannel):
+    async def prune_stale_backups_and_texts(self, channel: discord.TextChannel):
+        """Strictly keeps only the last 3 backup attachments and purges all old text notices/logs."""
         try:
-            valid_backups = []
-            async for msg in channel.history(limit=50):
-                if msg.author == self.bot.user and any(a.filename.endswith(".db") for a in msg.attachments):
-                    valid_backups.append(msg)
+            backup_messages = []
+            stray_bot_messages = []
 
-            valid_backups.sort(key=lambda m: m.created_at, reverse=True)
-            to_delete = valid_backups[KEEP_BACKUP_COUNT:]
+            async for msg in channel.history(limit=100):
+                if msg.author == self.bot.user:
+                    # Check if this message has a database attachment
+                    has_db = any(a.filename.endswith(".db") for a in msg.attachments)
+                    if has_db:
+                        backup_messages.append(msg)
+                    else:
+                        stray_bot_messages.append(msg)
+
+            # 1. Prune all non-backup bot text messages in #bot-memory
+            for stray in stray_bot_messages:
+                try:
+                    await stray.delete()
+                    await asyncio.sleep(0.4)
+                except discord.NotFound:
+                    pass
+                except Exception:
+                    pass
+
+            # 2. Sort backup archives newest -> oldest
+            backup_messages.sort(key=lambda m: m.created_at, reverse=True)
+
+            # 3. Retain strictly the newest 3 backups, delete the rest
+            to_delete = backup_messages[KEEP_BACKUP_COUNT:]
             for stale_msg in to_delete:
                 try:
                     await stale_msg.delete()
@@ -60,11 +81,15 @@ class DiscordMemoryBackup(commands.Cog):
                 except discord.NotFound:
                     pass
                 except Exception as e:
-                    print(f"[BACKUP PRUNE ERROR] Failed deleting message {stale_msg.id}: {e}")
+                    print(f"[BACKUP PRUNE ERROR] Failed deleting backup message {stale_msg.id}: {e}")
+
+            if to_delete or stray_bot_messages:
+                print(f"[BACKUP VAULT] Pruned {len(to_delete)} old backups and {len(stray_bot_messages)} text records. Retained: {min(len(backup_messages), KEEP_BACKUP_COUNT)}")
         except Exception as e:
-            print(f"[BACKUP PRUNE ERROR] {e}")
+            print(f"[BACKUP CLEANUP ERROR] {e}")
 
     async def upload_backup_and_prune(self, reason: str = "Routine Sync") -> tuple[bool, str]:
+        """Thread-safe snapshot export to #bot-memory with strict retention enforcement."""
         async with self.backup_lock:
             backup_id = int(os.getenv("BACKUP_CHANNEL_ID", getattr(config, "BACKUP_CHANNEL_ID", 0)))
             if not backup_id or backup_id == 0:
@@ -116,7 +141,7 @@ class DiscordMemoryBackup(commands.Cog):
                     timestamp=now_utc
                 )
                 embed.add_field(name="Trigger Reason", value=f"`{reason}`", inline=True)
-                embed.add_field(name="Retained Limit", value=f"`Last {KEEP_BACKUP_COUNT} Files`", inline=True)
+                embed.add_field(name="Retained Limit", value=f"`Last {KEEP_BACKUP_COUNT} Snapshots`", inline=True)
                 embed.add_field(name="Last Bump Recorded", value=bump_info, inline=True)
                 embed.add_field(name="Birthdays", value=f"`{b_count}`", inline=True)
                 embed.add_field(name="Tracked Members", value=f"`{l_count}`", inline=True)
@@ -140,7 +165,8 @@ class DiscordMemoryBackup(commands.Cog):
                     except Exception:
                         pass
 
-            await self.prune_stale_backups(channel)
+            # Prune to strictly 3 backups and clear stray texts
+            await self.prune_stale_backups_and_texts(channel)
             return True, "Success"
 
     def mark_dirty(self, reason: str = "Database Mutation"):
@@ -165,10 +191,10 @@ class DiscordMemoryBackup(commands.Cog):
     @commands.command(name="backup")
     @commands.has_permissions(administrator=True)
     async def manual_backup_cmd(self, ctx: commands.Context):
-        msg = await ctx.send("⏳ Generating snapshot and dispatching to `#bot-memory`...")
+        msg = await ctx.send("⏳ Generating snapshot and synchronizing `#bot-memory`...")
         success, detail = await self.upload_backup_and_prune(reason=f"Manual execution by {ctx.author.name}")
         if success:
-            await msg.edit(content=f"✅ **Database snapshot successfully stored!** Older backups pruned (retaining last {KEEP_BACKUP_COUNT}).")
+            await msg.edit(content=f"✅ **Database snapshot saved!** Old files and text records pruned (strictly retaining last {KEEP_BACKUP_COUNT} backups).")
         else:
             await msg.edit(content=f"❌ **Backup Failed:** `{detail}`")
 
