@@ -20,7 +20,7 @@ intents.voice_states = True
 
 
 def generate_command_directory_embed(bot: commands.Bot, guild: discord.Guild) -> discord.Embed:
-    """Dynamically builds an scannable directory by reading active commands across loaded cogs."""
+    """Dynamically builds a scannable directory by reading active commands across loaded cogs."""
     total_commands = len([c for c in bot.commands if not c.hidden])
 
     embed = discord.Embed(
@@ -43,6 +43,7 @@ def generate_command_directory_embed(bot: commands.Bot, guild: discord.Guild) ->
         "Bumping": ("🚀 Server Bump Engine", "Bump server ranking and claim +200 XP rewards"),
         "AFK": ("💤 AFK & Away Protocols", "Custom auto-responder away messages and nickname prefixes"),
         "Moderation": ("🛡️ Staff Moderation & Sanctions", "Infraction management, timeouts, kicks, and bans"),
+        "Music": ("🎵 AtomMusic & Audio Lounge", "Interactive music controller, streaming playback, and queue"),
         "Announcements": ("📢 Broadcast Studio", "Formal server broadcasts and preview delivery"),
         "Revive": ("⚡ Chat Revive Protocols", "Server activity triggers and engaging discussion prompts"),
         "Welcome": ("🌐 Gateway & Welcome Portal", "Persistent server rules, channel maps, and guide panels"),
@@ -73,7 +74,10 @@ def generate_command_directory_embed(bot: commands.Bot, guild: discord.Guild) ->
                 inline=False
             )
 
-    embed.set_footer(text="Project-Edith • Live Auto-Updating Directory", icon_url=bot.user.display_avatar.url if bot.user else None)
+    embed.set_footer(
+        text="Project-Edith • Live Auto-Updating Directory",
+        icon_url=bot.user.display_avatar.url if bot.user else None
+    )
     return embed
 
 
@@ -444,7 +448,9 @@ class UtilityBot(commands.Bot):
             restore_str = f"Error: `{self.restore_report.get('error', 'Unknown')}`"
 
         embed.add_field(name="Storage State", value=restore_str, inline=False)
-        embed.set_footer(text=f"Project-Edith • Startup Diagnostics | Status: {'ALL SYSTEMS GO' if overall_healthy else 'OPERATING WITH WARNINGS'}")
+        embed.set_footer(
+            text=f"Project-Edith • Startup Diagnostics | Status: {'ALL SYSTEMS GO' if overall_healthy else 'OPERATING WITH WARNINGS'}"
+        )
         return embed, overall_healthy
 
     async def on_ready(self):
@@ -462,9 +468,7 @@ class UtilityBot(commands.Bot):
             err_channel = await self.get_or_create_error_log_channel(guild)
             if err_channel:
                 try:
-                    # Prune old diagnostic/restore embeds so strictly the last 3 remain
                     await prune_stale_diagnostic_reports(err_channel, self.user)
-
                     report_embed, _ = await self.run_diagnostic_suite(guild)
                     await err_channel.send(embed=report_embed)
                 except Exception as e:
