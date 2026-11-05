@@ -36,9 +36,8 @@ class DiscordMemoryBackup(commands.Cog):
             except Exception:
                 pass
 
-        # Connect with URI read-only flag to prevent locking against live aiosqlite
-        src = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=15.0)
-        dst = sqlite3.connect(temp)
+        src = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=20.0)
+        dst = sqlite3.connect(temp, timeout=20.0)
         with dst:
             src.backup(dst, pages=100)
         dst.close()
@@ -46,7 +45,6 @@ class DiscordMemoryBackup(commands.Cog):
         return temp
 
     async def prune_stale_backups(self, channel: discord.TextChannel):
-        """Scans channel history and deletes all backups except the 3 newest."""
         try:
             valid_backups = []
             async for msg in channel.history(limit=50):
@@ -67,7 +65,6 @@ class DiscordMemoryBackup(commands.Cog):
             print(f"[BACKUP PRUNE ERROR] {e}")
 
     async def upload_backup_and_prune(self, reason: str = "Routine Sync") -> tuple[bool, str]:
-        """Thread-safe snapshot export to #bot-memory with instant pruning of older backups."""
         async with self.backup_lock:
             backup_id = int(os.getenv("BACKUP_CHANNEL_ID", getattr(config, "BACKUP_CHANNEL_ID", 0)))
             if not backup_id or backup_id == 0:
@@ -90,6 +87,7 @@ class DiscordMemoryBackup(commands.Cog):
                 print(f"[BACKUP ERROR] {err}")
                 return False, err
 
+            temp_file = None
             try:
                 loop = asyncio.get_running_loop()
                 temp_file = await loop.run_in_executor(None, self._create_snapshot)
@@ -129,18 +127,18 @@ class DiscordMemoryBackup(commands.Cog):
                     discord_file = discord.File(f, filename=filename)
                     await channel.send(embed=embed, file=discord_file)
 
-                if os.path.exists(temp_file):
-                    try:
-                        os.remove(temp_file)
-                    except Exception:
-                        pass
-
                 self.last_backup_time = now_utc.timestamp()
                 self.is_dirty = False
             except Exception as e:
                 err = f"Failed during snapshot creation or upload: {e}"
                 print(f"[BACKUP UPLOAD ERROR] {err}")
                 return False, err
+            finally:
+                if temp_file and os.path.exists(temp_file):
+                    try:
+                        os.remove(temp_file)
+                    except Exception:
+                        pass
 
             await self.prune_stale_backups(channel)
             return True, "Success"
