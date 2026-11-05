@@ -12,7 +12,6 @@ CONFIRMATION_DELETE_DELAY = 5
 
 
 def is_mod_authorized(member: discord.Member) -> bool:
-    """Verifies that the actor has Administrator, Director, or Moderator privileges."""
     if not isinstance(member, discord.Member):
         return False
     if member.guild_permissions.administrator or member.guild_permissions.ban_members or member.guild_permissions.moderate_members:
@@ -24,7 +23,6 @@ def is_mod_authorized(member: discord.Member) -> bool:
 
 
 def parse_time_duration(time_str: str) -> int:
-    """Parses duration strings like 10m, 2h, 1d into seconds."""
     time_str = time_str.strip()
     unit = time_str[-1].lower()
     try:
@@ -41,7 +39,6 @@ class Moderation(commands.Cog):
         self.bot = bot
 
     async def log_mod_action(self, embed: discord.Embed):
-        """Safely dispatches an audit record to the configured staff log channel."""
         try:
             log_id = int(os.getenv("TICKET_LOGS_CHANNEL_ID", getattr(config, "TICKET_LOGS_CHANNEL_ID", 0)))
             if not log_id or log_id == 0:
@@ -53,7 +50,6 @@ class Moderation(commands.Cog):
             print(f"[MOD LOG ERROR] Could not dispatch mod log: {e}")
 
     def can_moderate(self, actor: discord.Member, target: discord.Member) -> tuple[bool, str]:
-        """Validates role hierarchy between actor, target, and the bot itself."""
         if target.id == actor.id:
             return False, "You cannot execute moderation actions on yourself."
 
@@ -69,12 +65,43 @@ class Moderation(commands.Cog):
 
         return True, "OK"
 
-    # =========================================================================
-    # WARN COMMANDS
-    # =========================================================================
+    async def execute_purge(self, channel: discord.TextChannel, amount: int, target_member: discord.Member = None) -> int:
+        def check_filter(msg: discord.Message) -> bool:
+            return msg.author.id == target_member.id if target_member else True
+        deleted_messages = await channel.purge(limit=amount, check=check_filter, bulk=True)
+        return len(deleted_messages)
+
+    @commands.command(name="purge", aliases=["clear", "clean"])
+    async def prefix_purge(self, ctx: commands.Context, amount: int, member: discord.Member = None):
+        if not is_mod_authorized(ctx.author):
+            await ctx.send("⛔ **Access Denied:** Missing moderation authority.", delete_after=4)
+            return
+
+        if not (1 <= amount <= MAX_PURGE_LIMIT):
+            await ctx.send(f"❌ Enter an amount between `1` and `{MAX_PURGE_LIMIT}`.", delete_after=4)
+            return
+
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
+
+        count = await self.execute_purge(ctx.channel, amount, member)
+        embed = discord.Embed(
+            title="⚡ Messages Purged",
+            description=f"Purged **{count}** messages from {ctx.channel.mention}." + (f" (Author: {member.mention})" if member else "") + f"\n\n⏳ *Self-destructing in {CONFIRMATION_DELETE_DELAY}s.*",
+            color=discord.Color.teal(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        msg = await ctx.send(embed=embed)
+        await asyncio.sleep(CONFIRMATION_DELETE_DELAY)
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
     @commands.command(name="warn")
     async def prefix_warn(self, ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"):
-        """Issue an infraction notice: .warn @user spamming"""
         if not is_mod_authorized(ctx.author):
             await ctx.send("⛔ **Access Denied:** Only staff and authority roles can issue warnings.", delete_after=5)
             return
@@ -90,7 +117,6 @@ class Moderation(commands.Cog):
         """, (ctx.guild.id, member.id, ctx.author.id, reason))
         await self.bot.db.commit()
 
-        # Mark database dirty for backup sync
         backup_cog = self.bot.get_cog("DiscordMemoryBackup")
         if backup_cog and hasattr(backup_cog, "mark_dirty"):
             backup_cog.mark_dirty(reason="User Warning Registered")
@@ -101,7 +127,6 @@ class Moderation(commands.Cog):
         ) as cur:
             warn_count = (await cur.fetchone())[0]
 
-        # DM notification
         try:
             await member.send(f"⚠️ You received an official warning in **{ctx.guild.name}**:\n**Reason:** {reason}\n**Total Warnings:** {warn_count}")
         except Exception:
@@ -118,7 +143,6 @@ class Moderation(commands.Cog):
 
     @commands.command(name="warnings", aliases=["warns"])
     async def prefix_warnings(self, ctx: commands.Context, member: discord.Member = None):
-        """Check infraction record: .warnings @user"""
         target = member or ctx.author
         async with self.bot.db.execute("""
             SELECT id, moderator_id, reason, timestamp FROM warnings
@@ -153,7 +177,6 @@ class Moderation(commands.Cog):
     @commands.command(name="clearwarns")
     @commands.has_permissions(administrator=True)
     async def prefix_clearwarns(self, ctx: commands.Context, member: discord.Member):
-        """Wipe infraction history: .clearwarns @user"""
         await self.bot.db.execute("DELETE FROM warnings WHERE guild_id = ? AND user_id = ?", (ctx.guild.id, member.id))
         await self.bot.db.commit()
 
@@ -169,12 +192,8 @@ class Moderation(commands.Cog):
         await ctx.send(embed=embed)
         await self.log_mod_action(embed)
 
-    # =========================================================================
-    # MUTE / TIMEOUT COMMANDS
-    # =========================================================================
     @commands.command(name="mute", aliases=["timeout"])
     async def prefix_mute(self, ctx: commands.Context, member: discord.Member, duration: str = "10m", *, reason: str = "Rule violation"):
-        """Mute a user using Discord timeout: .mute @user 30m spamming"""
         if not is_mod_authorized(ctx.author):
             await ctx.send("⛔ **Access Denied:** Missing moderation authority.", delete_after=5)
             return
@@ -213,7 +232,6 @@ class Moderation(commands.Cog):
 
     @commands.command(name="unmute", aliases=["untimeout"])
     async def prefix_unmute(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Timeout lifted early"):
-        """Unmute a timed-out user: .unmute @user"""
         if not is_mod_authorized(ctx.author):
             await ctx.send("⛔ **Access Denied.**", delete_after=4)
             return
@@ -231,12 +249,8 @@ class Moderation(commands.Cog):
         except Exception as e:
             await ctx.send(f"❌ Failed to lift timeout: `{e}`", delete_after=5)
 
-    # =========================================================================
-    # BAN & KICK COMMANDS
-    # =========================================================================
     @commands.command(name="kick")
     async def prefix_kick(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Violating server directives"):
-        """Kick a member: .kick @user disruption"""
         if not is_mod_authorized(ctx.author):
             await ctx.send("⛔ **Access Denied.**", delete_after=4)
             return
@@ -266,7 +280,6 @@ class Moderation(commands.Cog):
 
     @commands.command(name="ban")
     async def prefix_ban(self, ctx: commands.Context, target: Union[discord.Member, discord.User], *, reason: str = "Severe infraction"):
-        """Ban a member or user ID: .ban @user [reason] or .ban 1234567890 [reason]"""
         if not is_mod_authorized(ctx.author):
             await ctx.send("⛔ **Access Denied.**", delete_after=4)
             return
@@ -299,7 +312,6 @@ class Moderation(commands.Cog):
 
     @commands.command(name="unban")
     async def prefix_unban(self, ctx: commands.Context, user_id: int, *, reason: str = "Pardon / Appeal accepted"):
-        """Unban by User ID: .unban 1234567890 [reason]"""
         if not is_mod_authorized(ctx.author):
             await ctx.send("⛔ **Access Denied.**", delete_after=4)
             return
