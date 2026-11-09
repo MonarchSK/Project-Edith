@@ -1,3 +1,4 @@
+import re
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -21,13 +22,43 @@ def get_target_channel(guild: discord.Guild, channel: discord.TextChannel = None
     announcement_id = int(getattr(config, "ANNOUNCEMENT_CHANNEL_ID", 0))
     if announcement_id:
         target = guild.get_channel(announcement_id)
-        if target:
+        if target and isinstance(target, discord.TextChannel):
             return target
     for name in ["announcements", "updates", "news"]:
         target = discord.utils.get(guild.text_channels, name=name)
         if target:
             return target
     return guild.system_channel or guild.text_channels[0]
+
+
+def resolve_ping_mention(guild: discord.Guild, raw_ping: str) -> str | None:
+    if not raw_ping:
+        return None
+    raw = raw_ping.strip()
+    if not raw:
+        return None
+
+    # Direct standard mentions
+    if raw in ("@everyone", "everyone"):
+        return "@everyone"
+    if raw in ("@here", "here"):
+        return "@here"
+
+    # Match raw role mention: <@&123456789>
+    role_mention_match = re.match(r"^<@&(\d+)>$", raw)
+    if role_mention_match:
+        role_id = int(role_mention_match.group(1))
+        role = guild.get_role(role_id)
+        if role:
+            return role.mention
+
+    # Match by role name (case-insensitive) or strip leading '@'
+    clean_name = raw.lstrip("@").lower()
+    for role in guild.roles:
+        if role.name.lower() == clean_name:
+            return role.mention
+
+    return raw
 
 
 class BroadcastConfirmView(discord.ui.View):
@@ -40,7 +71,7 @@ class BroadcastConfirmView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author.id:
-            await interaction.response.send_message("⛔ Only the author can confirm this broadcast.", ephemeral=True)
+            await interaction.response.send_message("⛔ Only the drafting author can confirm this broadcast.", ephemeral=True)
             return False
         return True
 
@@ -49,7 +80,19 @@ class BroadcastConfirmView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         for item in self.children:
             item.disabled = True
-        await interaction.edit_original_response(view=self)
+        try:
+            await interaction.edit_original_response(view=self)
+        except Exception:
+            pass
+
+        # Verify bot permissions in the target channel
+        my_perms = self.target_channel.permissions_for(interaction.guild.me)
+        if not my_perms.send_messages or not my_perms.embed_links:
+            await interaction.followup.send(
+                f"❌ Lacking permissions (`Send Messages` or `Embed Links`) in {self.target_channel.mention}.",
+                ephemeral=True
+            )
+            return
 
         allowed_mentions = discord.AllowedMentions(everyone=True, roles=True, users=True)
         content = self.ping_str if self.ping_str else None
@@ -78,12 +121,12 @@ class AnnouncementModal(discord.ui.Modal):
         label="Message Content (Supports Markdown)",
         style=discord.TextStyle.paragraph,
         placeholder="Type announcement content here...",
-        max_length=3000,
+        max_length=3500,
         required=True
     )
     ping_mention = discord.ui.TextInput(
         label="Ping Option (@everyone, @here, Role, None)",
-        placeholder="e.g. @everyone or leave blank",
+        placeholder="e.g. @everyone or Member (leave blank for none)",
         max_length=80,
         required=False
     )
@@ -94,12 +137,20 @@ class AnnouncementModal(discord.ui.Modal):
         required=False
     )
 
-    def __init__(self, target_channel: discord.TextChannel):
+    def __init__(self, target_channel: discord.TextChannel, studio_message: discord.Message = None):
         super().__init__(title="Draft Server Announcement")
         self.target_channel = target_channel
+        self.studio_message = studio_message
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+
+        # Clean up launcher message if invoked from prefix Studio
+        if self.studio_message:
+            try:
+                await self.studio_message.delete()
+            except Exception:
+                pass
 
         embed = discord.Embed(
             title=f"📢 {self.announcement_title.value.strip()}",
@@ -108,10 +159,10 @@ class AnnouncementModal(discord.ui.Modal):
             timestamp=datetime.now(timezone.utc)
         )
 
-        banner = self.banner_url.value.strip()
+        banner = self.banner_url.value.strip() if self.banner_url.value else ""
         if banner and (banner.startswith("http://") or banner.startswith("https://")):
             embed.set_image(url=banner)
-        elif hasattr(config, "COLOR_BANNER") and config.COLOR_BANNER:
+        elif getattr(config, "COLOR_BANNER", None):
             embed.set_image(url=config.COLOR_BANNER)
 
         if interaction.guild.icon:
@@ -122,7 +173,8 @@ class AnnouncementModal(discord.ui.Modal):
             icon_url=interaction.user.display_avatar.url
         )
 
-        ping_str = self.ping_mention.value.strip() if self.ping_mention.value else None
+        ping_str = resolve_ping_mention(interaction.guild, self.ping_mention.value)
+
         preview_view = BroadcastConfirmView(
             author=interaction.user,
             target_channel=self.target_channel,
@@ -181,18 +233,20 @@ class Announcements(commands.Cog):
             color=discord.Color.blue()
         )
 
-        view = discord.ui.View(timeout=60)
+        view = discord.ui.View(timeout=120)
         btn = discord.ui.Button(label="Open Draft Studio", style=discord.ButtonStyle.primary, emoji="📝")
+
+        studio_msg = None
 
         async def btn_callback(interaction: discord.Interaction):
             if not is_announcement_authorized(interaction.user):
                 await interaction.response.send_message("⛔ Authority clearance required.", ephemeral=True)
                 return
-            await interaction.response.send_modal(AnnouncementModal(target_channel=destination))
+            await interaction.response.send_modal(AnnouncementModal(target_channel=destination, studio_message=studio_msg))
 
         btn.callback = btn_callback
         view.add_item(btn)
-        await ctx.send(embed=embed, view=view)
+        studio_msg = await ctx.send(embed=embed, view=view)
 
 
 async def setup(bot):
