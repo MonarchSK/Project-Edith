@@ -10,7 +10,7 @@ from discord.ext import commands
 from datetime import datetime, timezone
 import config
 
-DB_PATH = "bot_database.db"
+DB_PATH = getattr(config, "DB_PATH", "bot_database.db")
 KEEP_DIAGNOSTIC_REPORTS_COUNT = 3
 
 intents = discord.Intents.default()
@@ -48,7 +48,13 @@ def generate_command_directory_embed(bot: commands.Bot, guild: discord.Guild) ->
         "Revive": ("⚡ Chat Revive Protocols", "Server activity triggers and engaging discussion prompts"),
         "Welcome": ("🌐 Gateway & Welcome Portal", "Persistent server rules, channel maps, and guide panels"),
         "DiscordMemoryBackup": ("📦 Persistent Storage Vault", "SQLite snapshot persistence to Discord cloud"),
-        "AuditLogs": ("📋 Audit & Message Monitoring", "Audit trail for edited and deleted messages")
+        "AuditLogs": ("📋 Audit & Message Monitoring", "Audit trail for edited and deleted messages"),
+        "Birthdays": ("🎂 Birthday Radar", "Server birthday directory, registration modal, and countdowns"),
+        "ColorRoles": ("🎨 Color Studio", "Preset and custom hex cosmetic username colors"),
+        "Confessions": ("🤫 Anonymous Confessions", "Confession booth submission modal"),
+        "LayoutSetup": ("🛠️ Control Layout", "Provisions administrative categories and channels"),
+        "Nicknames": ("🏷️ Identity Terminal", "Self-service nickname changes with level verification"),
+        "Tickets": ("📂 Dispatch & Tickets", "Private support desks and staff application workflows")
     }
 
     for cog_name, cog in sorted(bot.cogs.items()):
@@ -64,13 +70,17 @@ def generate_command_directory_embed(bot: commands.Bot, guild: discord.Guild) ->
             first_sentence = desc.split("\n")[0].split(". ")[0].strip()
             if not first_sentence.endswith("."):
                 first_sentence += "."
-            cmd_lines.append(f"`{bot.command_prefix[0] if isinstance(bot.command_prefix, (list, tuple)) else '.'}{cmd.name}` — {first_sentence}")
+            cmd_lines.append(f"`.{cmd.name}` — {first_sentence}")
 
         if cmd_lines:
             header_title, _ = cog_branding.get(cog_name, (f"📦 {cog_name}", ""))
+            # Safe chunking to fit under 1024 characters per field
+            content = "\n".join(cmd_lines[:8])
+            if len(content) > 1000:
+                content = content[:996] + "..."
             embed.add_field(
                 name=header_title,
-                value="\n".join(cmd_lines[:8]),
+                value=content,
                 inline=False
             )
 
@@ -83,18 +93,18 @@ def generate_command_directory_embed(bot: commands.Bot, guild: discord.Guild) ->
 
 async def resolve_or_create_commands_channel(guild: discord.Guild) -> discord.TextChannel | None:
     """Finds by ID, finds by fuzzy name match, or automatically provisions a #bot-commands channel."""
-    # 1. Check explicit ID from config or environment variable
     channel_id = int(os.getenv("COMMANDS_CHANNEL_ID", getattr(config, "COMMANDS_CHANNEL_ID", 0)))
     if channel_id and channel_id != 0:
         chan = guild.get_channel(channel_id)
-        if chan:
+        if chan and isinstance(chan, discord.TextChannel):
             return chan
         try:
-            return await guild.fetch_channel(channel_id)
+            fetched = await guild.fetch_channel(channel_id)
+            if isinstance(fetched, discord.TextChannel):
+                return fetched
         except Exception:
             pass
 
-    # 2. Fuzzy name matching across existing text channels
     candidates = [
         "bot-commands", "commands", "bot-cmd", "bot-directives", 
         "cmd-list", "bot-spam", "terminal", "directives"
@@ -104,7 +114,6 @@ async def resolve_or_create_commands_channel(guild: discord.Guild) -> discord.Te
         if any(term in lower_name for term in candidates):
             return c
 
-    # 3. Fallback: Auto-provision #bot-commands under general or control category
     target_category = None
     for cat in guild.categories:
         if any(keyword in cat.name.upper() for keyword in ["BACKUP", "CONTROL", "BOT", "SYSTEM", "GENERAL"]):
@@ -144,7 +153,6 @@ async def update_command_channel_panel(bot: commands.Bot, guild: discord.Guild) 
     try:
         target_msg = None
 
-        # Check pinned messages first
         try:
             pins = await channel.pins()
             for p in pins:
@@ -156,7 +164,6 @@ async def update_command_channel_panel(bot: commands.Bot, guild: discord.Guild) 
         except Exception:
             pass
 
-        # If not pinned, check recent history
         if not target_msg:
             async for msg in channel.history(limit=50):
                 if msg.author == bot.user and msg.embeds:
@@ -216,6 +223,7 @@ class UtilityBot(commands.Bot):
             help_command=None
         )
         self.db: aiosqlite.Connection = None
+        self.db_path: str = DB_PATH
         self._extensions_loaded = False
         self.boot_start_time = time.time()
         self.cog_load_status = {}
@@ -237,14 +245,17 @@ class UtilityBot(commands.Bot):
             return
 
         try:
-            channel = self.get_channel(backup_id) or await self.fetch_channel(backup_id)
+            channel = self.get_channel(backup_id)
+            if not channel:
+                channel = await self.fetch_channel(backup_id)
+
             print(f"[RESTORE] Scanning #{channel.name} for persistent backups...")
 
             async for message in channel.history(limit=50):
                 for attachment in message.attachments:
                     if attachment.filename.endswith(".db"):
-                        await attachment.save(DB_PATH)
-                        size_kb = os.path.getsize(DB_PATH) / 1024
+                        await attachment.save(self.db_path)
+                        size_kb = os.path.getsize(self.db_path) / 1024
                         self.restore_report = {
                             "success": True,
                             "filename": attachment.filename,
@@ -265,10 +276,10 @@ class UtilityBot(commands.Bot):
 
     async def setup_hook(self):
         await self.restore_database_from_discord()
-        self.db = await aiosqlite.connect(DB_PATH)
+        self.db = await aiosqlite.connect(self.db_path)
         await self.db.execute("PRAGMA journal_mode=WAL;")
 
-        # Schemas
+        # Initialize Base Schemas
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS birthdays (
                 user_id INTEGER PRIMARY KEY,
@@ -305,14 +316,6 @@ class UtilityBot(commands.Bot):
             )
         """)
         await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS weekly_level_snapshots (
-                user_id INTEGER PRIMARY KEY,
-                snapshot_xp INTEGER DEFAULT 0,
-                snapshot_messages INTEGER DEFAULT 0,
-                snapshot_voice INTEGER DEFAULT 0
-            )
-        """)
-        await self.db.execute("""
             CREATE TABLE IF NOT EXISTS revive_status (
                 guild_id INTEGER PRIMARY KEY,
                 last_revive_timestamp INTEGER DEFAULT 0,
@@ -336,6 +339,15 @@ class UtilityBot(commands.Bot):
                 reason TEXT DEFAULT 'AFK',
                 timestamp INTEGER NOT NULL,
                 original_nickname TEXT
+            )
+        """)
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS tickets (
+                channel_id INTEGER PRIMARY KEY,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                ticket_type TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
         await self.db.commit()
@@ -373,10 +385,13 @@ class UtilityBot(commands.Bot):
         print(f"[SLASH ERROR in /{interaction.command.name if interaction.command else 'Unknown'}] {err_tb}", file=sys.stderr)
 
         msg = "⚠️ An error occurred while executing this directive. Staff has been notified."
-        if not interaction.response.is_done():
-            await interaction.response.send_message(msg, ephemeral=True)
-        else:
-            await interaction.followup.send(msg, ephemeral=True)
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(msg, ephemeral=True)
+            else:
+                await interaction.followup.send(msg, ephemeral=True)
+        except Exception:
+            pass
 
         if interaction.guild:
             err_chan = await self.get_or_create_error_log_channel(interaction.guild)
@@ -396,7 +411,7 @@ class UtilityBot(commands.Bot):
         err_id = int(os.getenv("BOT_ERRORS_CHANNEL_ID", getattr(config, "BOT_ERRORS_CHANNEL_ID", 0)))
         if err_id:
             chan = guild.get_channel(err_id)
-            if chan:
+            if chan and isinstance(chan, discord.TextChannel):
                 return chan
 
         for chan in guild.text_channels:
@@ -444,7 +459,7 @@ class UtilityBot(commands.Bot):
         backup_id = int(os.getenv("BACKUP_CHANNEL_ID", getattr(config, "BACKUP_CHANNEL_ID", 0)))
         if backup_id:
             b_chan = guild.get_channel(backup_id)
-            if b_chan:
+            if b_chan and isinstance(b_chan, discord.TextChannel):
                 perms = b_chan.permissions_for(guild.me)
                 if perms.send_messages and perms.attach_files:
                     tests.append(("Cloud Backup Vault", f"✅ PASS (#{b_chan.name})"))
@@ -522,18 +537,19 @@ class UtilityBot(commands.Bot):
                     print(f"[DIAGNOSTICS DISPATCH ERROR] {e}")
 
     async def on_command_error(self, ctx: commands.Context, error: Exception):
-        if isinstance(error, commands.CommandNotFound):
+        orig = getattr(error, "original", error)
+        if isinstance(orig, commands.CommandNotFound):
             return
 
-        if isinstance(error, commands.MissingPermissions):
+        if isinstance(orig, commands.MissingPermissions):
             await ctx.send("⛔ **Access Denied:** You do not have the required permissions.", delete_after=5)
             return
 
-        if isinstance(error, commands.MissingRequiredArgument):
-            await ctx.send(f"❌ Missing required parameter: `{error.param.name}`. Run `.help {ctx.command}` for usage.", delete_after=6)
+        if isinstance(orig, commands.MissingRequiredArgument):
+            await ctx.send(f"❌ Missing required parameter: `{orig.param.name}`. Run `.help {ctx.command}` for usage.", delete_after=6)
             return
 
-        err_tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        err_tb = "".join(traceback.format_exception(type(orig), orig, orig.__traceback__))
         print(f"[COMMAND ERROR in {ctx.command}] {err_tb}", file=sys.stderr)
 
         err_chan = await self.get_or_create_error_log_channel(ctx.guild)
@@ -579,7 +595,7 @@ async def manual_update_panel(ctx: commands.Context):
 @bot.command(name="sync")
 @commands.has_permissions(administrator=True)
 async def instant_sync(ctx: commands.Context):
-    """Instantly syncs slash commands directly to the current guild in 1 second and refreshes the command panel."""
+    """Instantly syncs slash commands directly to the current guild and refreshes the command panel."""
     msg = await ctx.send("⏳ Registering slash commands and updating command roster...")
     try:
         bot.tree.copy_global_to(guild=ctx.guild)
