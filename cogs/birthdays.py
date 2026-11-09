@@ -71,7 +71,6 @@ class CleanBirthdayModal(discord.ui.Modal, title="Register Your Birthday"):
             await interaction.followup.send("❌ Please enter a valid day (1-31) and month (1-12).", ephemeral=True)
             return
 
-        # Validate actual calendar days for given month
         try:
             date(2024, m, d)  # Use leap year to allow Feb 29
         except ValueError:
@@ -155,11 +154,11 @@ class MasterSetModal(discord.ui.Modal):
             await interaction.followup.send(f"⚠️ Failed to save birthday: `{e}`", ephemeral=True)
 
 
-# --- User Select Dropdown for Master Control ---
+# --- User Select Dropdowns for Master Controls ---
 class DirectorMemberSelect(discord.ui.UserSelect):
     def __init__(self, cog):
         super().__init__(
-            placeholder="Choose a server member to set their birthday...",
+            placeholder="Choose a member to set/update their birthday...",
             min_values=1,
             max_values=1,
             custom_id="bday_director_select"
@@ -177,10 +176,47 @@ class DirectorMemberSelect(discord.ui.UserSelect):
                 await interaction.response.send_message(f"⚠️ Error: `{e}`", ephemeral=True)
 
 
-class MasterUserPickerView(discord.ui.View):
+class DirectorTriggerSelect(discord.ui.UserSelect):
+    def __init__(self, cog):
+        super().__init__(
+            placeholder="Choose a member to immediately trigger their birthday wish...",
+            min_values=1,
+            max_values=1,
+            custom_id="bday_trigger_select"
+        )
+        self.cog = cog
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            selected_user = self.values[0]
+            member = interaction.guild.get_member(selected_user.id) or selected_user
+            success, err_msg = await self.cog.dispatch_birthday_announcement(member.id, member.display_name)
+            if success:
+                await interaction.followup.send(f"🎉 Successfully triggered birthday announcement for {member.mention}!", ephemeral=True)
+            else:
+                await interaction.followup.send(f"⚠️ Failed to send announcement: {err_msg}", ephemeral=True)
+        except Exception as e:
+            print(f"[TRIGGER SELECT ERROR] {e}")
+            await interaction.followup.send(f"⚠️ Error: `{e}`", ephemeral=True)
+
+
+class MasterActionView(discord.ui.View):
     def __init__(self, cog):
         super().__init__(timeout=120)
-        self.add_item(DirectorMemberSelect(cog))
+        self.cog = cog
+
+    @discord.ui.button(label="Set / Update Member Birthday", style=discord.ButtonStyle.primary, emoji="✍️")
+    async def btn_set_member(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = discord.ui.View(timeout=120)
+        view.add_item(DirectorMemberSelect(self.cog))
+        await interaction.response.edit_message(content="Select a server member to set their birthday:", view=view)
+
+    @discord.ui.button(label="Force Announce Wish", style=discord.ButtonStyle.success, emoji="📢")
+    async def btn_trigger_wish(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = discord.ui.View(timeout=120)
+        view.add_item(DirectorTriggerSelect(self.cog))
+        await interaction.response.edit_message(content="Select a member to immediately post their birthday celebration:", view=view)
 
 
 # --- Main Clean Dashboard Buttons ---
@@ -291,15 +327,15 @@ class CleanBirthdayView(discord.ui.View):
         custom_id="bday_master_clean"
     )
     async def master_override(self, interaction: discord.Interaction, button: discord.ui.Button):
-        has_director = any(r.name == config.DIRECTOR_ROLE_NAME for r in interaction.user.roles)
+        has_director = any(r.name == config.DIRECTOR_ROLE_NAME for r in getattr(interaction.user, "roles", []))
         if not (has_director or interaction.user.guild_permissions.administrator):
             await interaction.response.send_message("⛔ Only Directors and Admins can use Master Register.", ephemeral=True)
             return
 
         try:
             await interaction.response.send_message(
-                "Select a member from the dropdown below:",
-                view=MasterUserPickerView(self.cog),
+                "👑 **Master Director Controls**\nChoose an action below to update a member or force an unannounced birthday celebration:",
+                view=MasterActionView(self.cog),
                 ephemeral=True
             )
         except Exception as e:
@@ -352,6 +388,36 @@ class Birthdays(commands.Cog):
 
         self.trigger_auto_backup(user_name)
 
+    async def dispatch_birthday_announcement(self, user_id: int, user_name: str) -> tuple[bool, str]:
+        """Dispatches the official celebration message into the announcement channel."""
+        channel_id = getattr(config, "ANNOUNCEMENT_CHANNEL_ID", None)
+        if not channel_id:
+            return False, "ANNOUNCEMENT_CHANNEL_ID is not configured in config.py"
+
+        channel = self.bot.get_channel(channel_id)
+        if not channel:
+            try:
+                channel = await self.bot.fetch_channel(channel_id)
+            except Exception as e:
+                return False, f"Could not locate announcement channel: {e}"
+
+        random_wish = random.choice(RANDOM_BIRTHDAY_WISHES)
+        embed = discord.Embed(
+            title="🎉 Happy Birthday!",
+            description=f"Happy Birthday to **{user_name}** (<@{user_id}>)!",
+            color=discord.Color.gold()
+        )
+        embed.add_field(
+            name="A Special Birthday Wish For You",
+            value=f"> *\"{random_wish}\"*",
+            inline=False
+        )
+        try:
+            await channel.send(content=f"🎂 <@{user_id}>", embed=embed)
+            return True, ""
+        except Exception as e:
+            return False, f"Failed to send message: {e}"
+
     async def create_panel_embed(self) -> discord.Embed:
         embed = discord.Embed(
             title="🎂 Register your birthday",
@@ -389,8 +455,7 @@ class Birthdays(commands.Cog):
     async def check_birthdays(self):
         now = datetime.now(timezone.utc)
         today_key = (now.year, now.month, now.day)
-        
-        # Guard against duplicate dispatches on clock drifts
+
         if self.last_announced_day == today_key:
             return
 
@@ -403,31 +468,35 @@ class Birthdays(commands.Cog):
         ) as cursor:
             celebrants = await cursor.fetchall()
 
-        channel_id = getattr(config, "ANNOUNCEMENT_CHANNEL_ID", None)
-        if not celebrants or not channel_id:
-            return
-
-        channel = self.bot.get_channel(channel_id)
-        if channel:
+        if celebrants:
             for uid, name in celebrants:
-                random_wish = random.choice(RANDOM_BIRTHDAY_WISHES)
-                embed = discord.Embed(
-                    title="🎉 Happy Birthday!",
-                    description=f"Happy Birthday to **{name}** (<@{uid}>)!",
-                    color=discord.Color.gold()
-                )
-                embed.add_field(
-                    name="A Special Birthday Wish For You",
-                    value=f"> *\"{random_wish}\"*",
-                    inline=False
-                )
-                await channel.send(content=f"🎂 <@{uid}>", embed=embed)
-            
+                await self.dispatch_birthday_announcement(uid, name)
             self.last_announced_day = today_key
 
     @check_birthdays.before_loop
     async def before_check(self):
         await self.bot.wait_until_ready()
+
+    @commands.command(name="trigger_birthday")
+    @commands.has_permissions(administrator=True)
+    async def prefix_manual_trigger(self, ctx: commands.Context, member: discord.Member):
+        """Manually trigger a birthday announcement: .trigger_birthday @User"""
+        success, err = await self.dispatch_birthday_announcement(member.id, member.display_name)
+        if success:
+            await ctx.send(f"✅ Successfully triggered birthday announcement for {member.mention}.")
+        else:
+            await ctx.send(f"❌ Failed to trigger announcement: `{err}`")
+
+    @app_commands.command(name="trigger_birthday", description="Manually trigger a birthday announcement for a member.")
+    @app_commands.describe(member="The member whose birthday announcement should be posted.")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def slash_manual_trigger(self, interaction: discord.Interaction, member: discord.Member):
+        await interaction.response.defer(ephemeral=True)
+        success, err = await self.dispatch_birthday_announcement(member.id, member.display_name)
+        if success:
+            await interaction.followup.send(f"✅ Successfully triggered birthday announcement for {member.mention}!", ephemeral=True)
+        else:
+            await interaction.followup.send(f"❌ Failed to trigger announcement: `{err}`", ephemeral=True)
 
     @commands.command(name="birthday_panel")
     @commands.has_permissions(administrator=True)
