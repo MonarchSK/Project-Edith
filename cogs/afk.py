@@ -26,27 +26,55 @@ DEFAULT_AFK_PRESETS = [
 ]
 
 AFK_CONFIRM_DISAPPEAR_SECONDS = 10
+AFK_ACTIVATION_COOLDOWN_SECONDS = 4  # Grace period so setting AFK does not immediately clear itself
 
 
 class AFK(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.recently_set_users = set()
+        # Maps user_id -> timestamp when AFK was registered
+        self.recently_set_timestamps: dict[int, float] = {}
+
+    async def cog_load(self):
+        """Ensures the afk table exists upon cog initialization."""
+        if hasattr(self.bot, "db") and self.bot.db:
+            await self.bot.db.execute("""
+                CREATE TABLE IF NOT EXISTS afk_users (
+                    user_id INTEGER PRIMARY KEY,
+                    guild_id INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    original_nickname TEXT
+                )
+            """)
+            await self.bot.db.commit()
 
     async def set_user_afk(self, guild: discord.Guild, member: discord.Member, reason: str) -> discord.Embed:
         now = int(time.time())
         original_nick = member.nick
 
-        await self.bot.db.execute("""
-            INSERT INTO afk_users (user_id, guild_id, reason, timestamp, original_nickname)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                guild_id = excluded.guild_id,
-                reason = excluded.reason,
-                timestamp = excluded.timestamp,
-                original_nickname = excluded.original_nickname
-        """, (member.id, guild.id, reason, now, original_nick))
-        await self.bot.db.commit()
+        if hasattr(self.bot, "db") and self.bot.db:
+            await self.bot.db.execute("""
+                CREATE TABLE IF NOT EXISTS afk_users (
+                    user_id INTEGER PRIMARY KEY,
+                    guild_id INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    original_nickname TEXT
+                )
+            """)
+            await self.bot.db.execute("""
+                INSERT INTO afk_users (user_id, guild_id, reason, timestamp, original_nickname)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    guild_id = excluded.guild_id,
+                    reason = excluded.reason,
+                    timestamp = excluded.timestamp,
+                    original_nickname = excluded.original_nickname
+            """, (member.id, guild.id, reason, now, original_nick))
+            await self.bot.db.commit()
+
+        self.recently_set_timestamps[member.id] = time.time()
 
         backup_cog = self.bot.get_cog("DiscordMemoryBackup")
         if backup_cog and hasattr(backup_cog, "mark_dirty"):
@@ -86,7 +114,6 @@ class AFK(commands.Cog):
     async def prefix_afk(self, ctx: commands.Context, *, reason: str = None):
         """Set your AFK status: .afk or .afk studying"""
         final_reason = reason.strip() if reason else random.choice(DEFAULT_AFK_PRESETS)
-        self.recently_set_users.add(ctx.author.id)
 
         try:
             await ctx.message.delete()
@@ -101,7 +128,6 @@ class AFK(commands.Cog):
     @app_commands.autocomplete(message=afk_preset_autocomplete)
     async def slash_afk(self, interaction: discord.Interaction, message: str = None):
         final_reason = message.strip() if message else random.choice(DEFAULT_AFK_PRESETS)
-        self.recently_set_users.add(interaction.user.id)
         embed = await self.set_user_afk(interaction.guild, interaction.user, final_reason)
 
         await interaction.response.send_message(embed=embed)
@@ -116,14 +142,18 @@ class AFK(commands.Cog):
         if message.author.bot or not message.guild:
             return
 
-        # Block any command execution from triggering AFK listeners
-        if message.content.startswith((".", ";")):
+        # Block bot prefix commands from clearing or triggering AFK notifications
+        if message.content.startswith((".", ";", "!", "/")):
+            return
+
+        if not hasattr(self.bot, "db") or not self.bot.db:
             return
 
         # 1. Clear AFK status when the user speaks in chat
-        if message.author.id in self.recently_set_users:
-            self.recently_set_users.remove(message.author.id)
-        else:
+        cooldown_timestamp = self.recently_set_timestamps.get(message.author.id, 0)
+        is_in_grace_period = (time.time() - cooldown_timestamp) < AFK_ACTIVATION_COOLDOWN_SECONDS
+
+        if not is_in_grace_period:
             async with self.bot.db.execute(
                 "SELECT reason, timestamp, original_nickname FROM afk_users WHERE user_id = ?",
                 (message.author.id,)
@@ -135,8 +165,14 @@ class AFK(commands.Cog):
                 await self.bot.db.execute("DELETE FROM afk_users WHERE user_id = ?", (message.author.id,))
                 await self.bot.db.commit()
 
+                if message.author.id in self.recently_set_timestamps:
+                    del self.recently_set_timestamps[message.author.id]
+
                 try:
-                    await message.author.edit(nick=original_nick, reason="User returned from AFK")
+                    target_nick = original_nick
+                    if target_nick and target_nick.startswith("[AFK] "):
+                        target_nick = target_nick[6:].strip()
+                    await message.author.edit(nick=target_nick, reason="User returned from AFK")
                 except discord.Forbidden:
                     pass
 
@@ -147,15 +183,21 @@ class AFK(commands.Cog):
                         f"You were away for <t:{afk_time}:R>.\n\n"
                         f"⏳ *Auto-clearing in {AFK_CONFIRM_DISAPPEAR_SECONDS}s.*"
                     ),
-                    color=discord.Color.green()
+                    color=discord.Color.green(),
+                    timestamp=datetime.now(timezone.utc)
                 )
                 await message.channel.send(embed=embed, delete_after=AFK_CONFIRM_DISAPPEAR_SECONDS)
 
         # 2. Alert users who mention an AFK member
         if message.mentions:
+            # Prevent spamming multiple notifications for duplicate mentions
+            handled_mentions = set()
+
             for mentioned in message.mentions:
-                if mentioned.id == message.author.id or mentioned.bot:
+                if mentioned.id == message.author.id or mentioned.bot or mentioned.id in handled_mentions:
                     continue
+
+                handled_mentions.add(mentioned.id)
 
                 async with self.bot.db.execute(
                     "SELECT reason, timestamp FROM afk_users WHERE user_id = ?",
