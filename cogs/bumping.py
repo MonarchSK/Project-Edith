@@ -64,11 +64,35 @@ class Bumping(commands.Cog):
 
     async def cog_load(self):
         self.bot.add_view(BumpView())
+        if hasattr(self.bot, "db") and self.bot.db:
+            await self.init_db()
+
+    async def init_db(self):
+        """Ensures the bump_status table and all necessary columns exist."""
+        await self.bot.db.execute("""
+            CREATE TABLE IF NOT EXISTS bump_status (
+                guild_id INTEGER PRIMARY KEY,
+                last_bump_timestamp INTEGER NOT NULL,
+                last_bumper_id INTEGER NOT NULL,
+                reminder_sent INTEGER DEFAULT 0,
+                last_channel_id INTEGER NOT NULL,
+                pre_reminder_sent INTEGER DEFAULT 0
+            )
+        """)
+        # Check if pre_reminder_sent exists for migrations
+        async with self.bot.db.execute("PRAGMA table_info(bump_status)") as cur:
+            columns = [row[1] for row in await cur.fetchall()]
+            if "pre_reminder_sent" not in columns:
+                await self.bot.db.execute("ALTER TABLE bump_status ADD COLUMN pre_reminder_sent INTEGER DEFAULT 0")
+        await self.bot.db.commit()
 
     def cog_unload(self):
         self.bump_reminder_loop.cancel()
 
     async def get_bump_status(self, guild_id: int) -> tuple[int, int, int, int, int]:
+        if not hasattr(self.bot, "db") or not self.bot.db:
+            return 0, 0, 1, 0, 1
+
         async with self.bot.db.execute(
             "SELECT last_bump_timestamp, last_bumper_id, reminder_sent, last_channel_id, pre_reminder_sent FROM bump_status WHERE guild_id = ?",
             (guild_id,)
@@ -81,6 +105,7 @@ class Bumping(commands.Cog):
 
     async def save_bump(self, guild_id: int, user_id: int, channel_id: int):
         now = int(time.time())
+        await self.init_db()
         await self.bot.db.execute("""
             INSERT INTO bump_status (guild_id, last_bump_timestamp, last_bumper_id, reminder_sent, last_channel_id, pre_reminder_sent)
             VALUES (?, ?, ?, 0, ?, 0)
@@ -182,20 +207,31 @@ class Bumping(commands.Cog):
         if not message.guild or message.content.startswith((".", ";")):
             return
 
+        # Handle Disboard bot bump responses
         if message.author.id == DISBOARD_BOT_ID and message.embeds:
             description = (message.embeds[0].description or "").lower()
             if "bump done" in description or "check it on disboard" in description:
                 bumper = None
-                async for prev_msg in message.channel.history(limit=5, before=message):
-                    if not prev_msg.author.bot:
-                        bumper = prev_msg.author
-                        break
+
+                # 1. Check if the Disboard message was invoked as an interaction
+                if getattr(message, "interaction", None) and message.interaction.user:
+                    bumper = message.interaction.user
+
+                # 2. Fall back to scanning recent message authors
+                if not bumper:
+                    async for prev_msg in message.channel.history(limit=7, before=message):
+                        if not prev_msg.author.bot:
+                            bumper = prev_msg.author
+                            break
 
                 target_user = bumper or message.guild.me
                 await self.process_successful_bump(message.guild, target_user, message.channel)
 
     @tasks.loop(minutes=1)
     async def bump_reminder_loop(self):
+        if not hasattr(self.bot, "db") or not self.bot.db:
+            return
+
         now = int(time.time())
 
         for guild in self.bot.guilds:
@@ -225,7 +261,7 @@ class Bumping(commands.Cog):
                     title="⏳ Bump Window Approaching (15 Minutes)",
                     description=(
                         f"Get ready! The server bump window opens in **15 minutes** (<t:{ready_time}:R>).\n\n"
-                        f"Run `.bump` or `/bump` at <t:{ready_time}:t> to claim **+{BUMP_REWARD_XP} XP**!"
+                        f"Run `/bump` or `.bump` at <t:{ready_time}:t> to claim **+{BUMP_REWARD_XP} XP**!"
                     ),
                     color=discord.Color.gold(),
                     timestamp=datetime.now(timezone.utc)
@@ -256,7 +292,7 @@ class Bumping(commands.Cog):
                     title="⏰ SERVER BUMP READY!",
                     description=(
                         f"The 2-hour cooldown has elapsed!\n\n"
-                        f"Run `.bump` or `/bump` now to boost the server and claim **+{BUMP_REWARD_XP} XP**!"
+                        f"Run `/bump` or `.bump` now to boost the server and claim **+{BUMP_REWARD_XP} XP**!"
                     ),
                     color=discord.Color.green(),
                     timestamp=datetime.now(timezone.utc)
