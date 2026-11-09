@@ -20,6 +20,14 @@ TEAM_QUESTION_POOL = [
     "Tell us about a time you resolved a conflict peacefully."
 ]
 
+TICKET_CATEGORY_NAME = "📂 TICKETS & DISPATCH"
+
+
+def sanitize_channel_name(name: str) -> str:
+    """Sanitizes username strings into Discord-safe channel names."""
+    clean = re.sub(r"[^a-zA-Z0-9_-]", "", name.lower())
+    return clean[:12] if clean else "user"
+
 
 def get_director_log_channel(guild: discord.Guild):
     """Finds the most suitable channel for archiving transcripts."""
@@ -29,7 +37,7 @@ def get_director_log_channel(guild: discord.Guild):
         if chan:
             return chan
 
-    for name in ["ticket-logs", "bot-errors", "bot-memory"]:
+    for name in ["ticket-logs", "mod-logs", "audit-logs", "bot-errors"]:
         chan = discord.utils.get(guild.text_channels, name=name)
         if chan:
             return chan
@@ -39,6 +47,26 @@ def get_director_log_channel(guild: discord.Guild):
         return category.text_channels[0]
 
     return None
+
+
+async def get_or_create_ticket_category(guild: discord.Guild) -> discord.CategoryChannel | None:
+    """Locates or provisions the ticket dispatch category."""
+    cat_id = int(getattr(config, "TICKET_CATEGORY_ID", 0))
+    if cat_id:
+        category = guild.get_channel(cat_id)
+        if category and isinstance(category, discord.CategoryChannel):
+            return category
+
+    category = discord.utils.get(guild.categories, name=TICKET_CATEGORY_NAME)
+    if not category:
+        try:
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False)
+            }
+            category = await guild.create_category(name=TICKET_CATEGORY_NAME, overwrites=overwrites)
+        except Exception:
+            category = None
+    return category
 
 
 async def generate_channel_transcript(channel: discord.TextChannel) -> tuple[io.BytesIO, int]:
@@ -58,7 +86,7 @@ async def generate_channel_transcript(channel: discord.TextChannel) -> tuple[io.
         if msg.embeds:
             embed_summaries = []
             for e in msg.embeds:
-                title = e.title or "Untitled"
+                title = e.title or "Untitled Embed"
                 embed_summaries.append(f"Embed: {title}")
             embeds_str = f"\n  [{' | '.join(embed_summaries)}]"
 
@@ -86,34 +114,73 @@ def extract_creator_id(topic: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-async def create_locked_channel(interaction: discord.Interaction, prefix: str, title: str, fields: list[tuple[str, str]], color: discord.Color):
+async def create_locked_channel(
+    interaction: discord.Interaction,
+    prefix: str,
+    title: str,
+    fields: list[tuple[str, str]],
+    color: discord.Color
+) -> discord.TextChannel | None:
     """Provisions a private locked channel, alerts Directors, and provides active controls."""
     guild = interaction.guild
     member = interaction.user
     timestamp = datetime.now(timezone.utc).strftime("%H%M")
-    channel_name = f"{prefix}-{member.name[:10]}-{timestamp}"
+    safe_name = sanitize_channel_name(member.name)
+    channel_name = f"{prefix}-{safe_name}-{timestamp}"
+
+    # Determine ticket category
+    category = await get_or_create_ticket_category(guild)
 
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False, read_messages=False),
-        member: discord.PermissionOverwrite(view_channel=True, read_messages=True, send_messages=True, attach_files=True),
-        guild.me: discord.PermissionOverwrite(view_channel=True, read_messages=True, send_messages=True, manage_channels=True)
+        member: discord.PermissionOverwrite(
+            view_channel=True,
+            read_messages=True,
+            send_messages=True,
+            attach_files=True,
+            embed_links=True
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True,
+            read_messages=True,
+            send_messages=True,
+            manage_channels=True,
+            manage_messages=True,
+            embed_links=True,
+            attach_files=True
+        )
     }
 
-    director_role = discord.utils.get(guild.roles, name=config.DIRECTOR_ROLE_NAME)
+    director_name = getattr(config, "DIRECTOR_ROLE_NAME", "Director")
+    director_role = discord.utils.get(guild.roles, name=director_name)
     if director_role:
         overwrites[director_role] = discord.PermissionOverwrite(
-            view_channel=True, read_messages=True, send_messages=True, manage_channels=True
+            view_channel=True,
+            read_messages=True,
+            send_messages=True,
+            manage_channels=True,
+            attach_files=True
         )
 
     for role in guild.roles:
         if role.permissions.administrator or role.name.lower() in ["admin", "administrator", "head mod"]:
-            overwrites[role] = discord.PermissionOverwrite(view_channel=True, read_messages=True, send_messages=True)
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                read_messages=True,
+                send_messages=True,
+                attach_files=True
+            )
 
-    channel = await guild.create_text_channel(
-        name=channel_name,
-        overwrites=overwrites,
-        topic=f"Private Desk // Creator: {member.name} ({member.id})"
-    )
+    try:
+        channel = await guild.create_text_channel(
+            name=channel_name,
+            category=category,
+            overwrites=overwrites,
+            topic=f"Private Desk // Creator: {member.name} ({member.id})"
+        )
+    except Exception as e:
+        print(f"[TICKET CREATION ERROR] {e}")
+        return None
 
     embed = discord.Embed(
         title=title,
@@ -169,7 +236,10 @@ class GeneralSupportModal(discord.ui.Modal, title="🎫 General Support Request"
             ],
             color=discord.Color.blue()
         )
-        await interaction.followup.send(f"✅ Your private support channel has been created: {channel.mention}", ephemeral=True)
+        if channel:
+            await interaction.followup.send(f"✅ Your private support channel has been created: {channel.mention}", ephemeral=True)
+        else:
+            await interaction.followup.send("⚠️ Failed to provision support channel. Check bot permissions.", ephemeral=True)
 
 
 class TeamApplicationModal(discord.ui.Modal, title="📝 Staff Team Application"):
@@ -225,7 +295,10 @@ class TeamApplicationModal(discord.ui.Modal, title="📝 Staff Team Application"
             ],
             color=discord.Color.gold()
         )
-        await interaction.followup.send(f"✅ Your staff application has been dispatched: {channel.mention}", ephemeral=True)
+        if channel:
+            await interaction.followup.send(f"✅ Your staff application has been dispatched: {channel.mention}", ephemeral=True)
+        else:
+            await interaction.followup.send("⚠️ Failed to provision application room. Check bot permissions.", ephemeral=True)
 
 
 class SuggestionModal(discord.ui.Modal, title="💡 Community Suggestion"):
@@ -256,7 +329,10 @@ class SuggestionModal(discord.ui.Modal, title="💡 Community Suggestion"):
             ],
             color=discord.Color.green()
         )
-        await interaction.followup.send(f"✅ Your suggestion room has been initialized: {channel.mention}", ephemeral=True)
+        if channel:
+            await interaction.followup.send(f"✅ Your suggestion room has been initialized: {channel.mention}", ephemeral=True)
+        else:
+            await interaction.followup.send("⚠️ Failed to initialize suggestion room. Check bot permissions.", ephemeral=True)
 
 
 class BotComplaintModal(discord.ui.Modal, title="⚠️ Bot Complaint / Bug Report"):
@@ -287,7 +363,10 @@ class BotComplaintModal(discord.ui.Modal, title="⚠️ Bot Complaint / Bug Repo
             ],
             color=discord.Color.red()
         )
-        await interaction.followup.send(f"✅ Your complaint has been submitted privately: {channel.mention}", ephemeral=True)
+        if channel:
+            await interaction.followup.send(f"✅ Your complaint has been submitted privately: {channel.mention}", ephemeral=True)
+        else:
+            await interaction.followup.send("⚠️ Failed to submit complaint room. Check bot permissions.", ephemeral=True)
 
 
 # --- Persistent Inside-Channel Controls ---
@@ -427,9 +506,9 @@ class Tickets(commands.Cog):
             ),
             color=discord.Color.from_rgb(88, 101, 242)
         )
-        if hasattr(config, "DEFAULT_ICON") and config.DEFAULT_ICON:
+        if getattr(config, "DEFAULT_ICON", None):
             embed.set_thumbnail(url=config.DEFAULT_ICON)
-        if hasattr(config, "TICKET_BANNER") and config.TICKET_BANNER:
+        if getattr(config, "TICKET_BANNER", None):
             embed.set_image(url=config.TICKET_BANNER)
 
         embed.add_field(
@@ -457,14 +536,11 @@ class Tickets(commands.Cog):
     @app_commands.command(name="ticket_panel", description="Deploy the Server Dispatch & Assistance Hub panel.")
     @app_commands.checks.has_permissions(administrator=True)
     async def slash_panel(self, interaction: discord.Interaction):
-        # 1. Immediately acknowledge interaction to extend deadline
         await interaction.response.defer(ephemeral=True)
-
         embed = self.create_panel_embed()
-        # 2. Send the panel message to the current channel
         await interaction.channel.send(embed=embed, view=self.active_view)
-        # 3. Use followup.send (NEVER interaction.response.send_message after defer)
         await interaction.followup.send("Dispatch hub deployed successfully.", ephemeral=True)
+
 
 async def setup(bot):
     await bot.add_cog(Tickets(bot))
