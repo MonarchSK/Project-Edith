@@ -1,3 +1,4 @@
+import os
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -26,7 +27,7 @@ class WelcomePortalView(discord.ui.View):
             description=(
                 "**1. Respect Everyone:** Zero tolerance for toxicity, hate speech, or harassment.\n"
                 "**2. Keep Channels On-Topic:** Use appropriate channels for media, commands, and bots.\n"
-                "**3. No Unauthorized Promotion:** Advertising or solicitation in DMs is banned.\n"
+                "**3. No Unauthorized Promotion:** Advertising or solicitation in DMs is strictly prohibited.\n"
                 "**4. Respect Discord ToS:** Follow all Discord Community Guidelines.\n"
                 "**5. Staff Authority:** Decisions made by Administrators and Directors are final."
             ),
@@ -75,6 +76,7 @@ class Welcome(commands.Cog):
         self.portal_view = WelcomePortalView()
 
     async def cog_load(self):
+        """Self-registers persistent view once to keep buttons functional across bot restarts."""
         self.bot.add_view(self.portal_view)
 
     def create_welcome_embed(self, guild: discord.Guild) -> discord.Embed:
@@ -144,6 +146,48 @@ class Welcome(commands.Cog):
         )
         return embed
 
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member):
+        """Greets new members and optionally assigns the base member role."""
+        guild = member.guild
+        if member.bot:
+            return
+
+        # 1. Auto-assign default member role if configured
+        role_name = getattr(config, "MEMBER_ROLE_NAME", None)
+        if role_name:
+            role = discord.utils.get(guild.roles, name=role_name)
+            if role:
+                try:
+                    await member.add_roles(role, reason="Auto-role assigned on join")
+                except discord.Forbidden:
+                    pass
+
+        # 2. Dispatch arrival greeting to welcome channel
+        welcome_channel_id = int(os.getenv("WELCOME_CHANNEL_ID", getattr(config, "WELCOME_CHANNEL_ID", 0)))
+        channel = guild.get_channel(welcome_channel_id) if welcome_channel_id else guild.system_channel
+        if not channel:
+            return
+
+        embed = discord.Embed(
+            title="👋 New Operative Arrived!",
+            description=(
+                f"Welcome {member.mention} to **{guild.name}**!\n\n"
+                f"• Check out our server rules and navigation directory below.\n"
+                f"• Level up by joining text chats and voice lounges!\n"
+                f"• You are member **#{guild.member_count}**."
+            ),
+            color=discord.Color.from_rgb(0, 168, 252),
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.set_footer(text="Project-Edith • Arrival Protocol")
+
+        try:
+            await channel.send(content=f"Welcome {member.mention}!", embed=embed, view=self.portal_view)
+        except Exception as e:
+            print(f"[WELCOME JOIN ERROR] {e}")
+
     @app_commands.command(name="welcome", description="Post the official long-form server welcome guide into a designated channel.")
     @app_commands.describe(channel="Channel where the welcome message should be published")
     async def slash_welcome(self, interaction: discord.Interaction, channel: discord.TextChannel = None):
@@ -170,6 +214,7 @@ class Welcome(commands.Cog):
 
     @commands.command(name="welcome", aliases=["postwelcome", "welcomepanel"])
     async def prefix_welcome(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """Deploy the welcome guide: .welcome [#channel]"""
         if not is_welcome_authorized(ctx.author):
             try:
                 await ctx.message.delete()
