@@ -93,12 +93,29 @@ class ReviveRoleToggleView(discord.ui.View):
 class Revive(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self.active_view = ReviveRoleToggleView()
 
     async def cog_load(self):
-        self.bot.add_view(ReviveRoleToggleView())
+        self.bot.add_view(self.active_view)
+        if hasattr(self.bot, "db") and self.bot.db:
+            await self.init_db()
+
+    async def init_db(self):
+        await self.bot.db.execute("""
+            CREATE TABLE IF NOT EXISTS revive_status (
+                guild_id INTEGER PRIMARY KEY,
+                last_revive_timestamp INTEGER NOT NULL,
+                last_reviver_id INTEGER NOT NULL
+            )
+        """)
+        await self.bot.db.commit()
 
     async def get_cooldown_status(self, guild_id: int) -> tuple[bool, int, str]:
         now = int(time.time())
+        if not hasattr(self.bot, "db") or not self.bot.db:
+            return True, 0, ""
+
+        await self.init_db()
         try:
             async with self.bot.db.execute(
                 "SELECT last_revive_timestamp FROM revive_status WHERE guild_id = ?",
@@ -122,6 +139,7 @@ class Revive(commands.Cog):
 
     async def save_revive_timestamp(self, guild_id: int, user_id: int):
         now = int(time.time())
+        await self.init_db()
         await self.bot.db.execute("""
             INSERT INTO revive_status (guild_id, last_revive_timestamp, last_reviver_id)
             VALUES (?, ?, ?)
@@ -151,7 +169,7 @@ class Revive(commands.Cog):
         )
         if guild.icon:
             embed.set_thumbnail(url=guild.icon.url)
-        if hasattr(config, "COLOR_BANNER") and config.COLOR_BANNER:
+        if getattr(config, "COLOR_BANNER", None):
             embed.set_image(url=config.COLOR_BANNER)
 
         embed.add_field(name="Initiated By", value=author.mention, inline=True)
@@ -190,13 +208,12 @@ class Revive(commands.Cog):
         await self.save_revive_timestamp(interaction.guild_id, interaction.user.id)
 
         embed = self.create_revive_embed(interaction.guild, interaction.user, topic)
-        view = ReviveRoleToggleView()
 
         try:
             await interaction.channel.send(
                 content=f"📢 {role_mention}",
                 embed=embed,
-                view=view,
+                view=self.active_view,
                 allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False)
             )
             await interaction.followup.send("✅ Chat revive broadcast dispatched successfully.", ephemeral=True)
@@ -206,6 +223,7 @@ class Revive(commands.Cog):
     # --- Prefix Command: .revive [topic] or ;revive [topic] ---
     @commands.command(name="revive", aliases=["chatrevive", "wake"])
     async def prefix_revive(self, ctx: commands.Context, *, topic: str = None):
+        """Broadcast chat revive: .revive [optional topic]"""
         if not is_revive_authorized(ctx.author):
             try:
                 await ctx.message.delete()
@@ -222,11 +240,11 @@ class Revive(commands.Cog):
                 description=f"Chat revive is cooling down.\nYou can awaken chat again in **{time_str}** (<t:{ready_epoch}:R>).",
                 color=discord.Color.orange()
             )
-            await ctx.send(embed=embed, delete_after=8)
             try:
                 await ctx.message.delete()
             except Exception:
                 pass
+            await ctx.send(embed=embed, delete_after=8)
             return
 
         try:
@@ -240,12 +258,11 @@ class Revive(commands.Cog):
         await self.save_revive_timestamp(ctx.guild.id, ctx.author.id)
 
         embed = self.create_revive_embed(ctx.guild, ctx.author, topic)
-        view = ReviveRoleToggleView()
 
         await ctx.channel.send(
             content=f"📢 {role_mention}",
             embed=embed,
-            view=view,
+            view=self.active_view,
             allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False)
         )
 
