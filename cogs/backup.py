@@ -2,13 +2,14 @@ import os
 import asyncio
 import sqlite3
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 from datetime import datetime, timezone
 import config
 
-DB_PATH = "bot_database.db"
+DB_PATH = getattr(config, "DB_PATH", "bot_database.db")
 KEEP_BACKUP_COUNT = 3
-MIN_INTERVAL_BETWEEN_SNAPSHOTS = 600
+MIN_INTERVAL_BETWEEN_SNAPSHOTS = 600  # 10 minutes debounce
 
 
 class DiscordMemoryBackup(commands.Cog):
@@ -22,27 +23,111 @@ class DiscordMemoryBackup(commands.Cog):
 
     async def cog_load(self):
         self.backup_worker_task = asyncio.create_task(self._debounced_backup_worker())
+        # Check and restore snapshot on fresh container boots
+        asyncio.create_task(self.restore_latest_backup_if_empty())
 
     def cog_unload(self):
         self.hourly_backup.cancel()
         if self.backup_worker_task and not self.backup_worker_task.done():
             self.backup_worker_task.cancel()
 
+    def _get_active_db_path(self) -> str:
+        return getattr(self.bot, "db_path", DB_PATH)
+
     def _create_snapshot(self) -> str:
-        temp = "temp_backup.db"
-        if os.path.exists(temp):
+        active_db = self._get_active_db_path()
+        if not os.path.exists(active_db):
+            raise FileNotFoundError(f"Source database file '{active_db}' does not exist.")
+
+        temp_target = f"temp_backup_{os.getpid()}_{int(datetime.now(timezone.utc).timestamp())}.db"
+        if os.path.exists(temp_target):
             try:
-                os.remove(temp)
+                os.remove(temp_target)
             except Exception:
                 pass
 
-        src = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=20.0)
-        dst = sqlite3.connect(temp, timeout=20.0)
-        with dst:
-            src.backup(dst, pages=100)
-        dst.close()
-        src.close()
-        return temp
+        src = sqlite3.connect(f"file:{active_db}?mode=ro", uri=True, timeout=25.0)
+        dst = sqlite3.connect(temp_target, timeout=25.0)
+        try:
+            with dst:
+                src.backup(dst, pages=100)
+        finally:
+            dst.close()
+            src.close()
+
+        return temp_target
+
+    async def get_backup_channel(self) -> discord.TextChannel | None:
+        backup_id = int(os.getenv("BACKUP_CHANNEL_ID", getattr(config, "BACKUP_CHANNEL_ID", 0)))
+        if not backup_id:
+            return None
+
+        channel = self.bot.get_channel(backup_id)
+        if not channel:
+            try:
+                channel = await self.bot.fetch_channel(backup_id)
+            except Exception:
+                return None
+        return channel if isinstance(channel, discord.TextChannel) else None
+
+    async def restore_latest_backup_if_empty(self):
+        """Auto-recovers database state on fresh Render container boot if local DB has no records."""
+        await self.bot.wait_until_ready()
+        await asyncio.sleep(5)  # Allow other cogs to initialize database handles
+
+        if not hasattr(self.bot, "db") or not self.bot.db:
+            return
+
+        # Check if birthdays or levels already have data
+        has_data = False
+        try:
+            async with self.bot.db.execute("SELECT COUNT(*) FROM birthdays") as cur:
+                if (await cur.fetchone())[0] > 0:
+                    has_data = True
+        except Exception:
+            pass
+
+        if has_data:
+            return
+
+        channel = await self.get_backup_channel()
+        if not channel:
+            return
+
+        try:
+            latest_db_attachment = None
+            async for msg in channel.history(limit=50):
+                if msg.author == self.bot.user:
+                    for att in msg.attachments:
+                        if att.filename.endswith(".db"):
+                            latest_db_attachment = att
+                            break
+                    if latest_db_attachment:
+                        break
+
+            if not latest_db_attachment:
+                return
+
+            print(f"[RECOVERY ENGINE] Fresh database detected. Restoring snapshot from #{channel.name} ({latest_db_attachment.filename})...")
+            download_path = "restored_backup.db"
+            await latest_db_attachment.save(download_path)
+
+            # Safely replace active db data
+            active_db = self._get_active_db_path()
+            src = sqlite3.connect(download_path)
+            dst = sqlite3.connect(active_db)
+            try:
+                with dst:
+                    src.backup(dst)
+                print("[RECOVERY ENGINE] Database state successfully restored from Discord cloud backup.")
+            finally:
+                src.close()
+                dst.close()
+                if os.path.exists(download_path):
+                    os.remove(download_path)
+
+        except Exception as e:
+            print(f"[RECOVERY ERROR] Failed restoring backup snapshot: {e}")
 
     async def prune_stale_backups_and_texts(self, channel: discord.TextChannel):
         """Strictly keeps only the last 3 backup snapshots and purges all old text notices/logs."""
@@ -90,20 +175,11 @@ class DiscordMemoryBackup(commands.Cog):
     async def upload_backup_and_prune(self, reason: str = "Routine Sync") -> tuple[bool, str]:
         """Thread-safe snapshot export to #bot-memory with strict retention enforcement."""
         async with self.backup_lock:
-            backup_id = int(os.getenv("BACKUP_CHANNEL_ID", getattr(config, "BACKUP_CHANNEL_ID", 0)))
-            if not backup_id or backup_id == 0:
-                err = "BACKUP_CHANNEL_ID is unset or 0 in config/env."
+            channel = await self.get_backup_channel()
+            if not channel:
+                err = "BACKUP_CHANNEL_ID is unset, invalid, or inaccessible."
                 print(f"[BACKUP ERROR] {err}")
                 return False, err
-
-            channel = self.bot.get_channel(backup_id)
-            if not channel:
-                try:
-                    channel = await self.bot.fetch_channel(backup_id)
-                except Exception as e:
-                    err = f"Could not find or fetch backup channel (ID: {backup_id}): {e}"
-                    print(f"[BACKUP ERROR] {err}")
-                    return False, err
 
             perms = channel.permissions_for(channel.guild.me)
             if not perms.send_messages or not perms.attach_files:
@@ -120,19 +196,29 @@ class DiscordMemoryBackup(commands.Cog):
                 filename = f"backup_{now_utc.strftime('%Y%m%d_%H%M%S')}.db"
 
                 b_count, l_count, c_count, bump_info = 0, 0, 0, "None"
-                try:
-                    async with self.bot.db.execute("SELECT COUNT(*) FROM birthdays") as cur:
-                        b_count = (await cur.fetchone())[0]
-                    async with self.bot.db.execute("SELECT COUNT(*) FROM levels") as cur:
-                        l_count = (await cur.fetchone())[0]
-                    async with self.bot.db.execute("SELECT COUNT(*) FROM confessions") as cur:
-                        c_count = (await cur.fetchone())[0]
-                    async with self.bot.db.execute("SELECT last_bump_timestamp FROM bump_status LIMIT 1") as cur:
-                        row = await cur.fetchone()
-                        if row and row[0]:
-                            bump_info = f"<t:{row[0]}:R>"
-                except Exception:
-                    pass
+                if hasattr(self.bot, "db") and self.bot.db:
+                    try:
+                        async with self.bot.db.execute("SELECT COUNT(*) FROM birthdays") as cur:
+                            b_count = (await cur.fetchone())[0]
+                    except Exception:
+                        pass
+                    try:
+                        async with self.bot.db.execute("SELECT COUNT(*) FROM levels") as cur:
+                            l_count = (await cur.fetchone())[0]
+                    except Exception:
+                        pass
+                    try:
+                        async with self.bot.db.execute("SELECT COUNT(*) FROM confessions") as cur:
+                            c_count = (await cur.fetchone())[0]
+                    except Exception:
+                        pass
+                    try:
+                        async with self.bot.db.execute("SELECT last_bump_timestamp FROM bump_status LIMIT 1") as cur:
+                            row = await cur.fetchone()
+                            if row and row[0]:
+                                bump_info = f"<t:{row[0]}:R>"
+                    except Exception:
+                        pass
 
                 embed = discord.Embed(
                     title="📦 SQLite Cloud Snapshot Saved",
@@ -196,6 +282,16 @@ class DiscordMemoryBackup(commands.Cog):
             await msg.edit(content=f"✅ **Database snapshot saved!** Old files and text records pruned (strictly retaining last {KEEP_BACKUP_COUNT} backups).")
         else:
             await msg.edit(content=f"❌ **Backup Failed:** `{detail}`")
+
+    @app_commands.command(name="backup", description="Manually generate and upload a SQLite database snapshot.")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def manual_backup_slash(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        success, detail = await self.upload_backup_and_prune(reason=f"Slash command execution by {interaction.user.name}")
+        if success:
+            await interaction.followup.send(f"✅ **Database snapshot saved!** Old backups pruned to {KEEP_BACKUP_COUNT}.", ephemeral=True)
+        else:
+            await interaction.followup.send(f"❌ **Backup Failed:** `{detail}`", ephemeral=True)
 
 
 async def setup(bot):
