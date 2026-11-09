@@ -85,6 +85,7 @@ class XpDropClaimView(discord.ui.View):
         if is_server_booster(user):
             awarded_xp = math.ceil(self.xp_amount * BOOSTER_XP_MULTIPLIER)
 
+        # Pass raw amount; add_xp internally handles booster calculations
         await self.cog.add_xp(user, self.xp_amount, reason="Random XP Drop Claim", channel=interaction.channel)
 
         embed = discord.Embed(
@@ -130,6 +131,23 @@ class Leveling(commands.Cog):
         self.voice_xp_loop.start()
         self.weekly_report_loop.start()
 
+    async def cog_load(self):
+        if hasattr(self.bot, "db") and self.bot.db:
+            await self.init_db()
+
+    async def init_db(self):
+        await self.bot.db.execute("""
+            CREATE TABLE IF NOT EXISTS levels (
+                user_id INTEGER PRIMARY KEY,
+                user_name TEXT,
+                xp INTEGER DEFAULT 0,
+                level INTEGER DEFAULT 1,
+                messages_count INTEGER DEFAULT 0,
+                voice_minutes INTEGER DEFAULT 0
+            )
+        """)
+        await self.bot.db.commit()
+
     def cog_unload(self):
         self.voice_xp_loop.cancel()
         self.weekly_report_loop.cancel()
@@ -145,6 +163,10 @@ class Leveling(commands.Cog):
         vc_channel = member.voice.channel
         guild = member.guild
         voice_client = guild.voice_client
+
+        # Do not interrupt active music playback
+        if voice_client and voice_client.is_playing():
+            return
 
         try:
             if voice_client is None:
@@ -197,6 +219,7 @@ class Leveling(commands.Cog):
         return awarded_role_names
 
     async def get_or_create_user(self, user_id: int, username: str) -> dict:
+        await self.init_db()
         async with self.bot.db.execute(
             "SELECT user_id, user_name, xp, level, messages_count, voice_minutes FROM levels WHERE user_id = ?",
             (user_id,)
@@ -368,6 +391,7 @@ class Leveling(commands.Cog):
         view.message = msg
 
     async def generate_weekly_report_embed(self, guild: discord.Guild) -> discord.Embed:
+        await self.init_db()
         async with self.bot.db.execute("""
             SELECT user_id, user_name, level, xp, messages_count, voice_minutes
             FROM levels
@@ -458,7 +482,7 @@ class Leveling(commands.Cog):
             return
 
         # Explicitly ignore all bot command prefixes
-        if message.content.startswith((".", ";")):
+        if message.content.startswith((".", ";", "!", "/")):
             return
 
         now = time.time()
@@ -469,6 +493,7 @@ class Leveling(commands.Cog):
         self.msg_cooldowns[message.author.id] = now
         base_xp = random.randint(MSG_XP_MIN, MSG_XP_MAX)
 
+        await self.init_db()
         await self.bot.db.execute("""
             INSERT INTO levels (user_id, user_name, xp, level, messages_count, voice_minutes)
             VALUES (?, ?, 0, 1, 1, 0)
@@ -493,13 +518,16 @@ class Leveling(commands.Cog):
 
     @tasks.loop(minutes=1)
     async def voice_xp_loop(self):
+        if not hasattr(self.bot, "db") or not self.bot.db:
+            return
+
         for guild in self.bot.guilds:
             for vc in guild.voice_channels:
                 if len(vc.members) < 2 or vc == guild.afk_channel:
                     continue
 
                 for member in vc.members:
-                    if member.bot or member.voice.self_deaf or member.voice.deaf:
+                    if member.bot or not member.voice or member.voice.self_deaf or member.voice.deaf:
                         continue
 
                     await self.bot.db.execute("""
@@ -614,6 +642,17 @@ class Leveling(commands.Cog):
 
         await self.trigger_xp_drop(ctx.channel, amount)
 
+    @app_commands.command(name="dropxp", description="Spawn a manual XP Drop supply crate.")
+    @app_commands.describe(amount="Amount of XP in crate (10-1000)")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def slash_drop_cmd(self, interaction: discord.Interaction, amount: int = None):
+        if amount and not (10 <= amount <= 1000):
+            await interaction.response.send_message("❌ Amount must be between 10 and 1,000 XP.", ephemeral=True)
+            return
+
+        await interaction.response.send_message("📦 Spawning supply crate in chat...", ephemeral=True)
+        await self.trigger_xp_drop(interaction.channel, amount)
+
     @commands.command(name="setlevel")
     @commands.has_permissions(administrator=True)
     async def set_level_cmd(self, ctx: commands.Context, member: discord.Member, target_level: int):
@@ -634,6 +673,28 @@ class Leveling(commands.Cog):
         if awarded:
             msg += f" Assigned roles: {', '.join(awarded)}"
         await ctx.send(msg)
+
+    @app_commands.command(name="setlevel", description="Manually set a member's level.")
+    @app_commands.describe(member="Member to adjust", target_level="Target level (1-50)")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def slash_set_level(self, interaction: discord.Interaction, member: discord.Member, target_level: int):
+        if not (1 <= target_level <= MAX_LEVEL):
+            await interaction.response.send_message(f"❌ Level must be between 1 and {MAX_LEVEL}.", ephemeral=True)
+            return
+
+        await self.get_or_create_user(member.id, member.display_name)
+        await self.bot.db.execute("""
+            UPDATE levels
+            SET level = ?, xp = 0
+            WHERE user_id = ?
+        """, (target_level, member.id))
+        await self.bot.db.commit()
+
+        awarded = await self._assign_milestone_roles(member, target_level)
+        msg = f"✅ Set {member.mention}'s rank to **Level {target_level}**."
+        if awarded:
+            msg += f" Assigned roles: {', '.join(awarded)}"
+        await interaction.response.send_message(msg, ephemeral=True)
 
 
 async def setup(bot):
