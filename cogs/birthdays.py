@@ -1,6 +1,6 @@
 import random
 import asyncio
-from datetime import datetime, date, timezone
+from datetime import datetime, date, time, timezone
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -20,7 +20,7 @@ RANDOM_BIRTHDAY_WISHES = [
 ]
 
 def get_days_until(day: int, month: int) -> int:
-    today = date.today()
+    today = datetime.now(timezone.utc).date()
     try:
         target_this_year = date(today.year, month, day)
     except ValueError:
@@ -69,6 +69,13 @@ class CleanBirthdayModal(discord.ui.Modal, title="Register Your Birthday"):
 
         if not (1 <= d <= 31 and 1 <= m <= 12):
             await interaction.followup.send("❌ Please enter a valid day (1-31) and month (1-12).", ephemeral=True)
+            return
+
+        # Validate actual calendar days for given month
+        try:
+            date(2024, m, d)  # Use leap year to allow Feb 29
+        except ValueError:
+            await interaction.followup.send("❌ That day does not exist in the selected month.", ephemeral=True)
             return
 
         user_name = interaction.user.display_name
@@ -125,6 +132,12 @@ class MasterSetModal(discord.ui.Modal):
 
         if not (1 <= d <= 31 and 1 <= m <= 12):
             await interaction.followup.send("❌ Invalid date values.", ephemeral=True)
+            return
+
+        try:
+            date(2024, m, d)
+        except ValueError:
+            await interaction.followup.send("❌ That day does not exist in the selected month.", ephemeral=True)
             return
 
         try:
@@ -299,8 +312,9 @@ class CleanBirthdayView(discord.ui.View):
 class Birthdays(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.check_birthdays.start()
         self.active_view = CleanBirthdayView(self)
+        self.last_announced_day = None
+        self.check_birthdays.start()
 
     async def cog_load(self):
         """Self-registers persistent view once, preventing circular imports in main.py and duplicate modals."""
@@ -340,11 +354,11 @@ class Birthdays(commands.Cog):
 
     async def create_panel_embed(self) -> discord.Embed:
         embed = discord.Embed(
-            title="🎂 Register the birthday",
+            title="🎂 Register your birthday",
             description="Select an option below to register your birthday or view the full list with countdowns.",
             color=discord.Color.from_rgb(235, 69, 158)
         )
-        if config.BDAY_BANNER:
+        if getattr(config, "BDAY_BANNER", None):
             embed.set_image(url=config.BDAY_BANNER)
 
         roster_lines = []
@@ -370,19 +384,30 @@ class Birthdays(commands.Cog):
         embed.set_footer(text="Click 'Check Birthday' to see all member countdowns")
         return embed
 
-    @tasks.loop(hours=24)
+    # Loop executes once daily at 00:00 UTC
+    @tasks.loop(time=time(hour=0, minute=0, tzinfo=timezone.utc))
     async def check_birthdays(self):
         now = datetime.now(timezone.utc)
+        today_key = (now.year, now.month, now.day)
+        
+        # Guard against duplicate dispatches on clock drifts
+        if self.last_announced_day == today_key:
+            return
+
+        if not hasattr(self.bot, "db") or not self.bot.db:
+            return
+
         async with self.bot.db.execute(
             "SELECT user_id, user_name FROM birthdays WHERE day = ? AND month = ?",
             (now.day, now.month)
         ) as cursor:
             celebrants = await cursor.fetchall()
 
-        if not celebrants or not config.ANNOUNCEMENT_CHANNEL_ID:
+        channel_id = getattr(config, "ANNOUNCEMENT_CHANNEL_ID", None)
+        if not celebrants or not channel_id:
             return
 
-        channel = self.bot.get_channel(config.ANNOUNCEMENT_CHANNEL_ID)
+        channel = self.bot.get_channel(channel_id)
         if channel:
             for uid, name in celebrants:
                 random_wish = random.choice(RANDOM_BIRTHDAY_WISHES)
@@ -397,6 +422,8 @@ class Birthdays(commands.Cog):
                     inline=False
                 )
                 await channel.send(content=f"🎂 <@{uid}>", embed=embed)
+            
+            self.last_announced_day = today_key
 
     @check_birthdays.before_loop
     async def before_check(self):
