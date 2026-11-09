@@ -7,10 +7,12 @@ import config
 REQUIRED_NICKNAME_LEVEL = 10
 
 
-async def get_user_level(db, user_id: int) -> int:
-    """Fetches the user's current level from persistent levels table."""
+async def get_user_level(bot, user_id: int) -> int:
+    """Fetches the user's current level from persistent levels table with null-safety."""
+    if not hasattr(bot, "db") or not bot.db:
+        return 1
     try:
-        async with db.execute("SELECT level FROM levels WHERE user_id = ?", (user_id,)) as cursor:
+        async with bot.db.execute("SELECT level FROM levels WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else 1
     except Exception:
@@ -19,9 +21,12 @@ async def get_user_level(db, user_id: int) -> int:
 
 def is_privileged_override(member: discord.Member) -> bool:
     """Checks if the member is a Director or Admin who bypasses level restrictions."""
+    if not isinstance(member, discord.Member):
+        return False
     if member.guild_permissions.administrator:
         return True
-    return any(r.name == getattr(config, "DIRECTOR_ROLE_NAME", "Director") for r in member.roles)
+    director_role = getattr(config, "DIRECTOR_ROLE_NAME", "Director").lower()
+    return any(r.name.lower() == director_role for r in member.roles)
 
 
 # --- Modal: Change Nickname ---
@@ -46,7 +51,7 @@ class NicknameModal(discord.ui.Modal, title="Update Server Nickname"):
         desired_name = self.new_nick.value.strip()
 
         # Check level requirement
-        current_level = await get_user_level(self.cog.bot.db, member.id)
+        current_level = await get_user_level(self.cog.bot, member.id)
         if current_level < REQUIRED_NICKNAME_LEVEL and not is_privileged_override(member):
             embed = discord.Embed(
                 title="🔒 Level Requirement Not Met",
@@ -75,7 +80,24 @@ class NicknameModal(discord.ui.Modal, title="Update Server Nickname"):
 
         try:
             old_name = member.display_name
-            await member.edit(nick=desired_name, reason=f"Self-service nickname update (Level {current_level})")
+
+            # Check if user is currently AFK to update original_nickname in DB
+            is_afk = False
+            if hasattr(self.cog.bot, "db") and self.cog.bot.db:
+                async with self.cog.bot.db.execute("SELECT user_id FROM afk_users WHERE user_id = ?", (member.id,)) as cur:
+                    is_afk = await cur.fetchone() is not None
+
+            if is_afk:
+                await self.cog.bot.db.execute(
+                    "UPDATE afk_users SET original_nickname = ? WHERE user_id = ?",
+                    (desired_name, member.id)
+                )
+                await self.cog.bot.db.commit()
+                target_nick = f"[AFK] {desired_name}"[:32]
+            else:
+                target_nick = desired_name
+
+            await member.edit(nick=target_nick, reason=f"Self-service nickname update (Level {current_level})")
 
             embed = discord.Embed(
                 title="✅ Server Nickname Updated",
@@ -112,7 +134,7 @@ class NicknamePanelView(discord.ui.View):
     )
     async def change_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         member = interaction.user
-        current_level = await get_user_level(self.cog.bot.db, member.id)
+        current_level = await get_user_level(self.cog.bot, member.id)
 
         if current_level < REQUIRED_NICKNAME_LEVEL and not is_privileged_override(member):
             embed = discord.Embed(
@@ -121,12 +143,19 @@ class NicknamePanelView(discord.ui.View):
                     f"Custom nickname modification is reserved for experienced server operatives.\n\n"
                     f"• **Required:** `Level {REQUIRED_NICKNAME_LEVEL}`\n"
                     f"• **Your Current Level:** `Level {current_level}`\n"
-                    f"• **Progress:** `{current_level * 10}%` complete\n\n"
+                    f"• **Progress:** `{int(min(current_level / REQUIRED_NICKNAME_LEVEL, 1.0) * 100)}%` complete\n\n"
                     f"Level up by chatting in channels, spending time in voice, or running `.bump`!"
                 ),
                 color=discord.Color.from_rgb(230, 126, 34)
             )
             await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        if interaction.guild.me.top_role <= member.top_role and member.id != interaction.guild.owner_id:
+            await interaction.response.send_message(
+                "⚠️ **Hierarchy Restriction:** Your highest role is equal to or higher than Edith's highest role.",
+                ephemeral=True
+            )
             return
 
         await interaction.response.send_modal(NicknameModal(self.cog))
@@ -151,7 +180,22 @@ class NicknamePanelView(discord.ui.View):
             return
 
         try:
-            await member.edit(nick=None, reason="Self-service nickname reset to default")
+            # Check if user is currently AFK to update original_nickname in DB
+            is_afk = False
+            if hasattr(self.cog.bot, "db") and self.cog.bot.db:
+                async with self.cog.bot.db.execute("SELECT user_id FROM afk_users WHERE user_id = ?", (member.id,)) as cur:
+                    is_afk = await cur.fetchone() is not None
+
+            if is_afk:
+                await self.cog.bot.db.execute(
+                    "UPDATE afk_users SET original_nickname = ? WHERE user_id = ?",
+                    (None, member.id)
+                )
+                await self.cog.bot.db.commit()
+                await member.edit(nick=f"[AFK] {member.name}"[:32], reason="Nickname reset while AFK")
+            else:
+                await member.edit(nick=None, reason="Self-service nickname reset to default")
+
             embed = discord.Embed(
                 title="🔄 Nickname Reset",
                 description=f"Your nickname has been cleared and restored to **{member.name}**.",
@@ -170,7 +214,7 @@ class NicknamePanelView(discord.ui.View):
     async def check_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         member = interaction.user
-        current_level = await get_user_level(self.cog.bot.db, member.id)
+        current_level = await get_user_level(self.cog.bot, member.id)
         is_eligible = current_level >= REQUIRED_NICKNAME_LEVEL or is_privileged_override(member)
 
         embed = discord.Embed(
@@ -215,9 +259,9 @@ class Nicknames(commands.Cog):
             ),
             color=discord.Color.from_rgb(52, 152, 219)
         )
-        if hasattr(config, "COLOR_BANNER") and config.COLOR_BANNER:
+        if getattr(config, "COLOR_BANNER", None):
             embed.set_image(url=config.COLOR_BANNER)
-        elif hasattr(config, "TICKET_BANNER") and config.TICKET_BANNER:
+        elif getattr(config, "TICKET_BANNER", None):
             embed.set_image(url=config.TICKET_BANNER)
 
         embed.add_field(
