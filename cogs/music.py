@@ -139,31 +139,41 @@ class Song:
 
 
 class MusicPlayerControllerView(discord.ui.View):
-    def __init__(self, guild_music_state):
+    def __init__(self, guild_music_state=None):
         super().__init__(timeout=None)
         self.state = guild_music_state
 
+    def _resolve_state(self, interaction: discord.Interaction):
+        if self.state:
+            return self.state
+        music_cog = interaction.client.get_cog("Music")
+        if music_cog:
+            return music_cog.get_music_state(interaction.guild)
+        return None
+
     @discord.ui.button(emoji="⏮️", style=discord.ButtonStyle.secondary, custom_id="btn_music_prev")
     async def btn_prev(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.state.history:
+        state = self._resolve_state(interaction)
+        if not state or not state.history:
             await interaction.response.send_message("❌ No previously played track in history.", ephemeral=True)
             return
 
-        prev_song = self.state.history.pop()
-        if self.state.current_song:
-            self.state.queue.appendleft(self.state.current_song)
-        self.state.queue.appendleft(prev_song)
-        if self.state.voice_client:
-            self.state.voice_client.stop()
+        prev_song = state.history.pop()
+        if state.current_song:
+            state.queue.appendleft(state.current_song)
+        state.queue.appendleft(prev_song)
+        if state.voice_client:
+            state.voice_client.stop()
         await interaction.response.send_message("⏮️ Returning to previous track.", ephemeral=True)
 
     @discord.ui.button(emoji="⏯️", style=discord.ButtonStyle.primary, custom_id="btn_music_pause_resume")
     async def btn_pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
-        vc = self.state.voice_client
-        if not vc:
-            await interaction.response.send_message("❌ Bot is not connected.", ephemeral=True)
+        state = self._resolve_state(interaction)
+        if not state or not state.voice_client:
+            await interaction.response.send_message("❌ Bot is not connected to a voice channel.", ephemeral=True)
             return
 
+        vc = state.voice_client
         if vc.is_playing():
             vc.pause()
             await interaction.response.send_message("⏸️ Playback paused.", ephemeral=True)
@@ -175,34 +185,38 @@ class MusicPlayerControllerView(discord.ui.View):
 
     @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary, custom_id="btn_music_skip")
     async def btn_skip(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.state.voice_client or not self.state.voice_client.is_playing():
+        state = self._resolve_state(interaction)
+        if not state or not state.voice_client or not state.voice_client.is_playing():
             await interaction.response.send_message("❌ Nothing to skip.", ephemeral=True)
             return
 
-        self.state.voice_client.stop()
+        state.voice_client.stop()
         await interaction.response.send_message("⏭️ Skipped current track.", ephemeral=True)
 
     @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary, custom_id="btn_music_shuffle")
     async def btn_shuffle(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if len(self.state.queue) < 2:
+        state = self._resolve_state(interaction)
+        if not state or len(state.queue) < 2:
             await interaction.response.send_message("❌ Need at least 2 tracks in queue to shuffle.", ephemeral=True)
             return
 
-        queue_list = list(self.state.queue)
+        queue_list = list(state.queue)
         random.shuffle(queue_list)
-        self.state.queue = collections.deque(queue_list)
+        state.queue = collections.deque(queue_list)
         await interaction.response.send_message("🔀 Queue shuffled randomly.", ephemeral=True)
 
     @discord.ui.button(emoji="⏹️", style=discord.ButtonStyle.danger, custom_id="btn_music_stop")
     async def btn_stop(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.state.queue.clear()
-        if self.state.voice_client:
-            await self.state.voice_client.disconnect()
-        if self.state.current_message:
-            try:
-                await self.state.current_message.delete()
-            except Exception:
-                pass
+        state = self._resolve_state(interaction)
+        if state:
+            state.queue.clear()
+            if state.voice_client:
+                await state.voice_client.disconnect()
+            if state.current_message:
+                try:
+                    await state.current_message.delete()
+                except Exception:
+                    pass
         await interaction.response.send_message("⏹️ Playback stopped and disconnected.", ephemeral=True)
 
 
@@ -333,6 +347,11 @@ class Music(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.states: dict[int, GuildMusicState] = {}
+        self.persistent_view = MusicPlayerControllerView()
+
+    async def cog_load(self):
+        """Self-registers persistent view once so player buttons persist across reboots."""
+        self.bot.add_view(self.persistent_view)
 
     def get_music_state(self, guild: discord.Guild) -> GuildMusicState:
         if guild.id not in self.states or self.states[guild.id].audio_loop_task.done():
@@ -389,7 +408,7 @@ class Music(commands.Cog):
 
             vc.stop()
             vc.play(source, after=after_test)
-            
+
             await asyncio.sleep(2)
             if vc.is_playing():
                 await ctx.send("🔊 **Streaming test audio:** Packets are transmitting to the gateway.")
@@ -463,6 +482,30 @@ class Music(commands.Cog):
             if song.thumbnail:
                 embed.set_thumbnail(url=song.thumbnail)
             await ctx.send(embed=embed, delete_after=10)
+
+    @commands.command(name="stop", aliases=["disconnect", "dc"])
+    async def prefix_stop(self, ctx: commands.Context):
+        """Stop playback and disconnect: .stop"""
+        state = self.get_music_state(ctx.guild)
+        state.queue.clear()
+        if ctx.guild.voice_client:
+            await ctx.guild.voice_client.disconnect()
+        if state.current_message:
+            try:
+                await state.current_message.delete()
+            except Exception:
+                pass
+        await ctx.send("⏹️ Playback stopped and disconnected.", delete_after=6)
+
+    @commands.command(name="skip", aliases=["s", "next"])
+    async def prefix_skip(self, ctx: commands.Context):
+        """Skip currently playing track: .skip"""
+        vc = ctx.guild.voice_client
+        if not vc or not vc.is_playing():
+            await ctx.send("❌ Nothing is currently playing.", delete_after=4)
+            return
+        vc.stop()
+        await ctx.send("⏭️ Skipped current track.", delete_after=5)
 
     @commands.command(name="queue", aliases=["q"])
     async def prefix_queue(self, ctx: commands.Context):
