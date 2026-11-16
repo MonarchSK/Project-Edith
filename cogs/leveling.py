@@ -36,10 +36,11 @@ MILESTONE_ROLES = {
     50: ("Mythic Pinnacle", 0x9B59B6)
 }
 
-CUSTOM_EMOJI_PATTERN = re.compile(r"<a?:\w+:\d+>")
+CUSTOM_EMOJI_PATTERN = re.compile(r"<a?:\w+:(\d+)>")
 UNICODE_EMOJI_PATTERN = re.compile(
     r"[\U0001F1E6-\U0001F1FF"
-    r"\U0001F300-\U0001F5FF"
+    r"\U0001F300-\U0001F3FA"
+    r"\U0001F400-\U0001F5FF"
     r"\U0001F600-\U0001F64F"
     r"\U0001F680-\U0001F6FF"
     r"\U0001F700-\U0001F77F"
@@ -58,12 +59,12 @@ UNICODE_EMOJI_PATTERN = re.compile(
 
 
 def has_emoji_spam(content: str, threshold: int = EMOJI_SPAM_THRESHOLD) -> bool:
-    """Checks if any single custom or Unicode emoji appears >= threshold times."""
-    custom_matches = CUSTOM_EMOJI_PATTERN.findall(content)
+    """Checks if any single custom emoji ID or Unicode emoji appears >= threshold times."""
+    custom_ids = [f"custom_{eid}" for eid in CUSTOM_EMOJI_PATTERN.findall(content)]
     text_without_custom = CUSTOM_EMOJI_PATTERN.sub("", content)
     unicode_matches = UNICODE_EMOJI_PATTERN.findall(text_without_custom)
 
-    counts = collections.Counter(custom_matches + unicode_matches)
+    counts = collections.Counter(custom_ids + unicode_matches)
     return any(count >= threshold for count in counts.values())
 
 
@@ -224,7 +225,6 @@ class Leveling(commands.Cog):
         guild = member.guild
         voice_client = guild.voice_client
 
-        # Do not interrupt active or paused music sessions
         if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
             return
 
@@ -553,7 +553,6 @@ class Leveling(commands.Cog):
         if message.content.startswith((".", ";", "!", "/")):
             return
 
-        # Do not grant XP or spawn supply drops on messages flagged for emoji spam
         if not is_mod_exempt(message.author) and has_emoji_spam(message.content):
             return
 
