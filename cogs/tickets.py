@@ -23,6 +23,16 @@ TEAM_QUESTION_POOL = [
 TICKET_CATEGORY_NAME = "📂 TICKETS & DISPATCH"
 
 
+def is_ticket_staff(member: discord.Member) -> bool:
+    if not isinstance(member, discord.Member):
+        return False
+    if member.guild_permissions.administrator or member.guild_permissions.manage_channels:
+        return True
+    director_role = getattr(config, "DIRECTOR_ROLE_NAME", "Director").lower()
+    allowed = {director_role, "authority", "admin", "administrator", "head mod", "moderator", "mod"}
+    return any(r.name.lower() in allowed for r in member.roles)
+
+
 def sanitize_channel_name(name: str) -> str:
     """Sanitizes username strings into Discord-safe channel names."""
     clean = re.sub(r"[^a-zA-Z0-9_-]", "", name.lower())
@@ -128,7 +138,6 @@ async def create_locked_channel(
     safe_name = sanitize_channel_name(member.name)
     channel_name = f"{prefix}-{safe_name}-{timestamp}"
 
-    # Determine ticket category
     category = await get_or_create_ticket_category(guild)
 
     overwrites = {
@@ -182,6 +191,16 @@ async def create_locked_channel(
         print(f"[TICKET CREATION ERROR] {e}")
         return None
 
+    if hasattr(interaction.client, "db") and interaction.client.db:
+        try:
+            await interaction.client.db.execute("""
+                INSERT OR REPLACE INTO tickets (channel_id, guild_id, user_id, ticket_type)
+                VALUES (?, ?, ?, ?)
+            """, (channel.id, guild.id, member.id, prefix))
+            await interaction.client.db.commit()
+        except Exception:
+            pass
+
     embed = discord.Embed(
         title=title,
         description=f"🔒 **Locked Private Session**\nAuthorized Viewers: {member.mention}, Directors & Server Administrators.\n",
@@ -207,7 +226,6 @@ async def create_locked_channel(
     return channel
 
 
-# --- Modals ---
 class GeneralSupportModal(discord.ui.Modal, title="🎫 General Support Request"):
     subject = discord.ui.TextInput(
         label="Inquiry / Subject",
@@ -369,13 +387,16 @@ class BotComplaintModal(discord.ui.Modal, title="⚠️ Bot Complaint / Bug Repo
             await interaction.followup.send("⚠️ Failed to submit complaint room. Check bot permissions.", ephemeral=True)
 
 
-# --- Persistent Inside-Channel Controls ---
 class ActiveTicketControls(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="Claim Channel", style=discord.ButtonStyle.secondary, emoji="📌", custom_id="claim_ticket_btn")
     async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_ticket_staff(interaction.user):
+            await interaction.response.send_message("⛔ Only server staff or Directors can claim tickets.", ephemeral=True)
+            return
+
         button.disabled = True
         button.label = f"Claimed by {interaction.user.display_name[:16]}"
         button.style = discord.ButtonStyle.success
@@ -384,9 +405,23 @@ class ActiveTicketControls(discord.ui.View):
 
     @discord.ui.button(label="Close & Delete", style=discord.ButtonStyle.danger, emoji="🔒", custom_id="close_ticket_btn")
     async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
         channel = interaction.channel
+        creator_id = extract_creator_id(channel.topic)
 
+        if hasattr(interaction.client, "db") and interaction.client.db and not creator_id:
+            try:
+                async with interaction.client.db.execute("SELECT user_id FROM tickets WHERE channel_id = ?", (channel.id,)) as cur:
+                    row = await cur.fetchone()
+                    if row:
+                        creator_id = row[0]
+            except Exception:
+                pass
+
+        if not is_ticket_staff(interaction.user) and interaction.user.id != creator_id:
+            await interaction.response.send_message("⛔ Only staff or the ticket creator may close this channel.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
         await channel.send("📑 Compiling full audit transcript and dispatching records...")
 
         buffer, count = await generate_channel_transcript(channel)
@@ -394,7 +429,6 @@ class ActiveTicketControls(discord.ui.View):
         filename = f"transcript-{channel.name}-{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.txt"
 
         dm_delivered = False
-        creator_id = extract_creator_id(channel.topic)
         if creator_id:
             target_user = interaction.guild.get_member(creator_id)
             if not target_user:
@@ -427,6 +461,13 @@ class ActiveTicketControls(discord.ui.View):
                 except Exception as e:
                     print(f"[USER DM TRANSCRIPT ERROR] {e}")
                     dm_delivered = False
+
+        if hasattr(interaction.client, "db") and interaction.client.db:
+            try:
+                await interaction.client.db.execute("DELETE FROM tickets WHERE channel_id = ?", (channel.id,))
+                await interaction.client.db.commit()
+            except Exception:
+                pass
 
         log_channel = get_director_log_channel(interaction.guild)
         if log_channel:
@@ -461,7 +502,6 @@ class ActiveTicketControls(discord.ui.View):
             pass
 
 
-# --- Main Dashboard Panel View ---
 class TicketPluginView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -483,14 +523,12 @@ class TicketPluginView(discord.ui.View):
         await interaction.response.send_modal(BotComplaintModal())
 
 
-# --- Cog Definition ---
 class Tickets(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.active_view = TicketPluginView()
 
     async def cog_load(self):
-        """Self-registers persistent views once so buttons work across restarts without duplicates."""
         self.bot.add_view(self.active_view)
         self.bot.add_view(ActiveTicketControls())
 
