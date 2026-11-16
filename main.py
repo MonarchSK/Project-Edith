@@ -58,14 +58,12 @@ def generate_command_directory_embed(bot: commands.Bot, guild: discord.Guild) ->
     }
 
     for cog_name, cog in sorted(bot.cogs.items()):
-        cog_commands = cog.get_commands()
+        cog_commands = [c for c in cog.get_commands() if not c.hidden]
         if not cog_commands:
             continue
 
         cmd_lines = []
         for cmd in cog_commands:
-            if cmd.hidden:
-                continue
             desc = cmd.help or cmd.description or "Execute command"
             first_sentence = desc.split("\n")[0].split(". ")[0].strip()
             if not first_sentence.endswith("."):
@@ -74,8 +72,10 @@ def generate_command_directory_embed(bot: commands.Bot, guild: discord.Guild) ->
 
         if cmd_lines:
             header_title, _ = cog_branding.get(cog_name, (f"📦 {cog_name}", ""))
-            # Safe chunking to fit under 1024 characters per field
-            content = "\n".join(cmd_lines[:8])
+            displayed = cmd_lines[:8]
+            if len(cmd_lines) > 8:
+                displayed.append(f"*...and {len(cmd_lines) - 8} more directives*")
+            content = "\n".join(displayed)
             if len(content) > 1000:
                 content = content[:996] + "..."
             embed.add_field(
@@ -106,7 +106,7 @@ async def resolve_or_create_commands_channel(guild: discord.Guild) -> discord.Te
             pass
 
     candidates = [
-        "bot-commands", "commands", "bot-cmd", "bot-directives", 
+        "bot-commands", "commands", "bot-cmd", "bot-directives",
         "cmd-list", "bot-spam", "terminal", "directives"
     ]
     for c in guild.text_channels:
@@ -225,6 +225,7 @@ class UtilityBot(commands.Bot):
         self.db: aiosqlite.Connection = None
         self.db_path: str = DB_PATH
         self._extensions_loaded = False
+        self._initial_ready_done = False
         self.boot_start_time = time.time()
         self.cog_load_status = {}
         self.slash_sync_count = 0
@@ -270,6 +271,7 @@ class UtilityBot(commands.Bot):
             err_msg = str(e)
             print(f"[RESTORE ERROR] Could not retrieve snapshot: {err_msg}")
             self.restore_report["error"] = err_msg
+            return
 
         print("[RESTORE] No prior backup file found. Initializing clean database.")
         self.restore_report["is_fresh"] = True
@@ -381,7 +383,19 @@ class UtilityBot(commands.Bot):
         self.tree.on_error = self.on_tree_error
 
     async def on_tree_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
-        err_tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        orig = getattr(error, "original", error)
+        if isinstance(orig, app_commands.MissingPermissions):
+            msg = "⛔ **Access Denied:** You lack the required permissions for this slash directive."
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(msg, ephemeral=True)
+                else:
+                    await interaction.followup.send(msg, ephemeral=True)
+            except Exception:
+                pass
+            return
+
+        err_tb = "".join(traceback.format_exception(type(orig), orig, orig.__traceback__))
         print(f"[SLASH ERROR in /{interaction.command.name if interaction.command else 'Unknown'}] {err_tb}", file=sys.stderr)
 
         msg = "⚠️ An error occurred while executing this directive. Staff has been notified."
@@ -520,6 +534,10 @@ class UtilityBot(commands.Bot):
             activity=discord.Activity(type=discord.ActivityType.watching, name="over server | .help")
         )
 
+        if self._initial_ready_done:
+            return
+        self._initial_ready_done = True
+
         for guild in self.guilds:
             try:
                 success, msg = await update_command_channel_panel(self, guild)
@@ -595,15 +613,16 @@ async def manual_update_panel(ctx: commands.Context):
 @bot.command(name="sync")
 @commands.has_permissions(administrator=True)
 async def instant_sync(ctx: commands.Context):
-    """Instantly syncs slash commands directly to the current guild and refreshes the command panel."""
-    msg = await ctx.send("⏳ Registering slash commands and updating command roster...")
+    """Syncs global slash commands and clears duplicate guild-scoped copies."""
+    msg = await ctx.send("⏳ Synchronizing slash commands and updating command roster...")
     try:
-        bot.tree.copy_global_to(guild=ctx.guild)
-        synced = await bot.tree.sync(guild=ctx.guild)
+        bot.tree.clear_commands(guild=ctx.guild)
+        await bot.tree.sync(guild=ctx.guild)
+        synced = await bot.tree.sync()
 
         success, detail = await update_command_channel_panel(bot, ctx.guild)
 
-        status_text = f"✅ **Synced {len(synced)} slash commands!**"
+        status_text = f"✅ **Synced {len(synced)} global slash commands!**"
         if success:
             status_text += f"\n📋 **Directory:** {detail}"
         else:
