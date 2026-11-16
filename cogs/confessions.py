@@ -1,5 +1,4 @@
 import os
-import asyncio
 from datetime import datetime, timezone
 import discord
 from discord import app_commands
@@ -27,7 +26,6 @@ class ConfessionModal(discord.ui.Modal, title="🤫 Anonymous Confession"):
             await interaction.followup.send("⚠️ Database connection is still initializing. Please try again shortly.", ephemeral=True)
             return
 
-        # Ensure the target confessions table exists
         await self.cog.init_db()
 
         content = self.text.value.strip()
@@ -41,7 +39,6 @@ class ConfessionModal(discord.ui.Modal, title="🤫 Anonymous Confession"):
             await interaction.followup.send(f"⚠️ Failed to save confession to database: `{e}`", ephemeral=True)
             return
 
-        # Notify backup engine of database mutation
         backup_cog = self.cog.bot.get_cog("DiscordMemoryBackup")
         if backup_cog and hasattr(backup_cog, "mark_dirty"):
             backup_cog.mark_dirty(reason="Anonymous Confession Logged")
@@ -58,7 +55,6 @@ class ConfessionModal(discord.ui.Modal, title="🤫 Anonymous Confession"):
             await interaction.followup.send("❌ Target confession channel could not be found or is not configured.", ephemeral=True)
             return
 
-        # Permission check
         perms = channel.permissions_for(interaction.guild.me)
         if not perms.send_messages or not perms.embed_links:
             await interaction.followup.send(f"❌ Missing permissions (`Send Messages` or `Embed Links`) in {channel.mention}.", ephemeral=True)
@@ -101,17 +97,16 @@ class Confessions(commands.Cog):
         self.active_view = ConfessionPluginView(self)
 
     async def cog_load(self):
-        """Self-registers persistent view once to preserve interactive buttons across bot reboots."""
         self.bot.add_view(self.active_view)
         if hasattr(self.bot, "db") and self.bot.db:
             await self.init_db()
 
     async def init_db(self):
-        """Ensures the confessions table is created in SQLite."""
         await self.bot.db.execute("""
             CREATE TABLE IF NOT EXISTS confessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                content TEXT NOT NULL
+                content TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
         await self.bot.db.commit()
@@ -126,7 +121,7 @@ class Confessions(commands.Cog):
             embed.set_thumbnail(url=config.DEFAULT_ICON)
         if getattr(config, "CONFESSION_BANNER", None):
             embed.set_image(url=config.CONFESSION_BANNER)
-            
+
         embed.add_field(name="Security", value="• 100% Identity scrubbed\n• Auto-sequential numbering", inline=False)
         embed.set_footer(text="Confessions Booth • Anonymous & Secure")
         return embed
