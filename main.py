@@ -54,7 +54,8 @@ def generate_command_directory_embed(bot: commands.Bot, guild: discord.Guild) ->
         "Confessions": ("🤫 Anonymous Confessions", "Confession booth submission modal"),
         "LayoutSetup": ("🛠️ Control Layout", "Provisions administrative categories and channels"),
         "Nicknames": ("🏷️ Identity Terminal", "Self-service nickname changes with level verification"),
-        "Tickets": ("📂 Dispatch & Tickets", "Private support desks and staff application workflows")
+        "Tickets": ("📂 Dispatch & Tickets", "Private support desks and staff application workflows"),
+        "PrivateVC": ("🔒 Private Voice Lounges", "On-demand invite-only voice rooms with auto-cleanup")
     }
 
     for cog_name, cog in sorted(bot.cogs.items()):
@@ -350,6 +351,14 @@ class UtilityBot(commands.Bot):
                 user_id INTEGER NOT NULL,
                 ticket_type TEXT NOT NULL,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS private_vcs (
+                channel_id INTEGER PRIMARY KEY,
+                guild_id INTEGER NOT NULL,
+                owner_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
             )
         """)
         await self.db.commit()
