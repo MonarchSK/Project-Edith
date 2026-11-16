@@ -13,11 +13,14 @@ MAX_PURGE_LIMIT = 100
 CONFIRMATION_DELETE_DELAY = 5
 EMOJI_SPAM_THRESHOLD = 4
 
-# Matches custom Discord emojis (<:name:id> or <a:name:id>) and individual Unicode emoji characters
-CUSTOM_EMOJI_PATTERN = re.compile(r"<a?:\w+:\d+>")
+# Captures (full_emoji_tag, emoji_id) so random emoji names with the same ID are grouped together
+CUSTOM_EMOJI_PATTERN = re.compile(r"(<a?:\w+:(\d+)>)")
+
+# Matches individual Unicode emojis (excluding skin-tone modifiers/variation selectors so 👍🏻 and 👍 count as the same emoji)
 UNICODE_EMOJI_PATTERN = re.compile(
     r"[\U0001F1E6-\U0001F1FF"
-    r"\U0001F300-\U0001F5FF"
+    r"\U0001F300-\U0001F3FA"
+    r"\U0001F400-\U0001F5FF"
     r"\U0001F600-\U0001F64F"
     r"\U0001F680-\U0001F6FF"
     r"\U0001F700-\U0001F77F"
@@ -36,15 +39,27 @@ UNICODE_EMOJI_PATTERN = re.compile(
 
 
 def find_repeated_emoji(content: str, threshold: int = EMOJI_SPAM_THRESHOLD) -> str | None:
-    """Returns the offending emoji if any single custom or Unicode emoji appears >= threshold times."""
-    custom_matches = CUSTOM_EMOJI_PATTERN.findall(content)
-    text_without_custom = CUSTOM_EMOJI_PATTERN.sub("", content)
-    unicode_matches = UNICODE_EMOJI_PATTERN.findall(text_without_custom)
+    """
+    Detects if the same emoji appears >= threshold times in a message.
+    Groups custom Discord emojis by their unique numeric ID (ignoring random emoji names).
+    """
+    counts = collections.Counter()
+    display_map = {}
 
-    counts = collections.Counter(custom_matches + unicode_matches)
-    for emoji_token, count in counts.items():
+    for full_tag, emoji_id in CUSTOM_EMOJI_PATTERN.findall(content):
+        key = f"custom_{emoji_id}"
+        counts[key] += 1
+        display_map[key] = full_tag
+
+    text_without_custom = CUSTOM_EMOJI_PATTERN.sub("", content)
+    for uni_emoji in UNICODE_EMOJI_PATTERN.findall(text_without_custom):
+        counts[uni_emoji] += 1
+        display_map[uni_emoji] = uni_emoji
+
+    for key, count in counts.items():
         if count >= threshold:
-            return emoji_token
+            return display_map[key]
+
     return None
 
 
@@ -137,14 +152,13 @@ class Moderation(commands.Cog):
 
         return True, "OK"
 
-    # --- Auto-Moderation: Same Emoji Spam Detector ---
+    # --- Auto-Moderation: 4 Same Emojis Not Allowed ---
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot or not message.guild:
             return
 
-        # Exempt staff and authorized moderators from auto-warn
         if is_mod_authorized(message.author):
             return
 
@@ -157,7 +171,7 @@ class Moderation(commands.Cog):
         except Exception:
             pass
 
-        reason = f"Spamming (Sent {EMOJI_SPAM_THRESHOLD}+ identical emojis: {spammed_emoji})"
+        reason = f"Spamming (4+ same emojis not allowed: {spammed_emoji})"
 
         await self.init_db()
         await self.bot.db.execute("""
@@ -178,20 +192,20 @@ class Moderation(commands.Cog):
 
         try:
             await message.author.send(
-                f"⚠️ **Auto-Moderation Warning in {message.guild.name}**\n"
-                f"• **Reason:** {reason}\n"
+                f"⚠️ **Warning Issued in {message.guild.name}**\n"
+                f"• **Reason:** Sending 4 of the same emoji is not allowed ({spammed_emoji}).\n"
                 f"• **Total Warnings:** `{warn_count}`"
             )
         except Exception:
             pass
 
         embed = discord.Embed(
-            title="🚨 Auto-Mod: Emoji Spam Detected",
+            title="🚨 Spamming Not Allowed",
             description=(
-                f"{message.author.mention} has received an automated warning for **Spamming**.\n\n"
-                f"• **Violation:** Sent `{EMOJI_SPAM_THRESHOLD}+` identical emojis ({spammed_emoji})\n"
+                f"{message.author.mention}, sending **{EMOJI_SPAM_THRESHOLD} or more of the same emoji** ({spammed_emoji}) is not allowed!\n\n"
+                f"• **Action:** Message deleted & Warning issued\n"
                 f"• **Total Warnings:** `{warn_count}`\n\n"
-                f"⏳ *This notice will auto-delete in 8 seconds.*"
+                f"⏳ *This notice will disappear in 8 seconds.*"
             ),
             color=discord.Color.gold(),
             timestamp=datetime.now(timezone.utc)
