@@ -23,8 +23,6 @@ class DiscordMemoryBackup(commands.Cog):
 
     async def cog_load(self):
         self.backup_worker_task = asyncio.create_task(self._debounced_backup_worker())
-        # Check and restore snapshot on fresh container boots
-        asyncio.create_task(self.restore_latest_backup_if_empty())
 
     def cog_unload(self):
         self.hourly_backup.cancel()
@@ -70,65 +68,6 @@ class DiscordMemoryBackup(commands.Cog):
                 return None
         return channel if isinstance(channel, discord.TextChannel) else None
 
-    async def restore_latest_backup_if_empty(self):
-        """Auto-recovers database state on fresh Render container boot if local DB has no records."""
-        await self.bot.wait_until_ready()
-        await asyncio.sleep(5)  # Allow other cogs to initialize database handles
-
-        if not hasattr(self.bot, "db") or not self.bot.db:
-            return
-
-        # Check if birthdays or levels already have data
-        has_data = False
-        try:
-            async with self.bot.db.execute("SELECT COUNT(*) FROM birthdays") as cur:
-                if (await cur.fetchone())[0] > 0:
-                    has_data = True
-        except Exception:
-            pass
-
-        if has_data:
-            return
-
-        channel = await self.get_backup_channel()
-        if not channel:
-            return
-
-        try:
-            latest_db_attachment = None
-            async for msg in channel.history(limit=50):
-                if msg.author == self.bot.user:
-                    for att in msg.attachments:
-                        if att.filename.endswith(".db"):
-                            latest_db_attachment = att
-                            break
-                    if latest_db_attachment:
-                        break
-
-            if not latest_db_attachment:
-                return
-
-            print(f"[RECOVERY ENGINE] Fresh database detected. Restoring snapshot from #{channel.name} ({latest_db_attachment.filename})...")
-            download_path = "restored_backup.db"
-            await latest_db_attachment.save(download_path)
-
-            # Safely replace active db data
-            active_db = self._get_active_db_path()
-            src = sqlite3.connect(download_path)
-            dst = sqlite3.connect(active_db)
-            try:
-                with dst:
-                    src.backup(dst)
-                print("[RECOVERY ENGINE] Database state successfully restored from Discord cloud backup.")
-            finally:
-                src.close()
-                dst.close()
-                if os.path.exists(download_path):
-                    os.remove(download_path)
-
-        except Exception as e:
-            print(f"[RECOVERY ERROR] Failed restoring backup snapshot: {e}")
-
     async def prune_stale_backups_and_texts(self, channel: discord.TextChannel):
         """Strictly keeps only the last 3 backup snapshots and purges all old text notices/logs."""
         try:
@@ -143,7 +82,6 @@ class DiscordMemoryBackup(commands.Cog):
                     else:
                         stray_bot_messages.append(msg)
 
-            # 1. Prune all non-backup bot text messages in #bot-memory
             for stray in stray_bot_messages:
                 try:
                     await stray.delete()
@@ -153,10 +91,8 @@ class DiscordMemoryBackup(commands.Cog):
                 except Exception:
                     pass
 
-            # 2. Sort backup archives newest -> oldest
             backup_messages.sort(key=lambda m: m.created_at, reverse=True)
 
-            # 3. Retain strictly the newest 3 backups, delete the rest
             to_delete = backup_messages[KEEP_BACKUP_COUNT:]
             for stale_msg in to_delete:
                 try:
@@ -175,6 +111,12 @@ class DiscordMemoryBackup(commands.Cog):
     async def upload_backup_and_prune(self, reason: str = "Routine Sync") -> tuple[bool, str]:
         """Thread-safe snapshot export to #bot-memory with strict retention enforcement."""
         async with self.backup_lock:
+            restore_report = getattr(self.bot, "restore_report", {})
+            if restore_report.get("error") and not restore_report.get("success"):
+                err = "Skipped backup: initial startup restore failed due to an API error. Avoiding overwrite."
+                print(f"[BACKUP SAFETY GUARD] {err}")
+                return False, err
+
             channel = await self.get_backup_channel()
             if not channel:
                 err = "BACKUP_CHANNEL_ID is unset, invalid, or inaccessible."
@@ -250,7 +192,6 @@ class DiscordMemoryBackup(commands.Cog):
                     except Exception:
                         pass
 
-            # Prune to strictly 3 backups and clear stray texts
             await self.prune_stale_backups_and_texts(channel)
             return True, "Success"
 
