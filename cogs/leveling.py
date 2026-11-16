@@ -1,4 +1,6 @@
 import os
+import stat
+import shutil
 import time
 import math
 import random
@@ -7,6 +9,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from datetime import datetime, timezone
+import imageio_ffmpeg
 import config
 
 MAX_LEVEL = 50
@@ -28,6 +31,21 @@ MILESTONE_ROLES = {
     25: ("Gold Operative", 0xFFD700),
     50: ("Mythic Pinnacle", 0x9B59B6)
 }
+
+
+def resolve_ffmpeg_binary() -> str:
+    try:
+        binary_path = imageio_ffmpeg.get_ffmpeg_exe()
+        if os.path.exists(binary_path):
+            current_perms = os.stat(binary_path).st_mode
+            os.chmod(binary_path, current_perms | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            return binary_path
+    except Exception:
+        pass
+    return shutil.which("ffmpeg") or "ffmpeg"
+
+
+FFMPEG_EXECUTABLE = resolve_ffmpeg_binary()
 
 
 def calculate_xp_for_level(level: int) -> int:
@@ -85,7 +103,6 @@ class XpDropClaimView(discord.ui.View):
         if is_server_booster(user):
             awarded_xp = math.ceil(self.xp_amount * BOOSTER_XP_MULTIPLIER)
 
-        # Pass raw amount; add_xp internally handles booster calculations
         await self.cog.add_xp(user, self.xp_amount, reason="Random XP Drop Claim", channel=interaction.channel)
 
         embed = discord.Embed(
@@ -127,7 +144,6 @@ class Leveling(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.msg_cooldowns = {}
-        self.voice_tracking = {}
         self.voice_xp_loop.start()
         self.weekly_report_loop.start()
 
@@ -164,18 +180,26 @@ class Leveling(commands.Cog):
         guild = member.guild
         voice_client = guild.voice_client
 
-        # Do not interrupt active music playback
-        if voice_client and voice_client.is_playing():
+        # Do not interrupt active or paused music sessions
+        if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
             return
 
+        music_cog = self.bot.get_cog("Music")
+        if music_cog and guild.id in getattr(music_cog, "states", {}):
+            state = music_cog.states[guild.id]
+            if state.queue or state.current_song:
+                return
+
+        connected_specifically_for_chime = False
         try:
             if voice_client is None:
-                voice_client = await vc_channel.connect(timeout=10.0, reconnect=False)
+                voice_client = await vc_channel.connect(timeout=10.0, reconnect=False, self_deaf=True)
+                connected_specifically_for_chime = True
             elif voice_client.channel != vc_channel:
-                await voice_client.move_to(vc_channel)
+                return
 
             if not voice_client.is_playing():
-                source = discord.FFmpegPCMAudio(sound_path)
+                source = discord.FFmpegPCMAudio(sound_path, executable=FFMPEG_EXECUTABLE)
                 voice_client.play(source)
 
                 timeout_counter = 0
@@ -183,10 +207,11 @@ class Leveling(commands.Cog):
                     await asyncio.sleep(0.5)
                     timeout_counter += 1
 
-                await voice_client.disconnect(force=True)
+                if connected_specifically_for_chime:
+                    await voice_client.disconnect(force=True)
         except Exception as e:
             print(f"[VOICE CHIME NOTICE] Could not play level up audio: {e}")
-            if voice_client and voice_client.is_connected():
+            if connected_specifically_for_chime and voice_client and voice_client.is_connected():
                 try:
                     await voice_client.disconnect(force=True)
                 except Exception:
@@ -409,7 +434,7 @@ class Leveling(commands.Cog):
         embed = discord.Embed(
             title="📈 Project-Edith // Weekly Community Level Report",
             description=(
-                f"Performance digest and activity ranking for **{guild.name}** over the past 7 days.\n"
+                f"Weekly leaderboard digest and cumulative activity standings for **{guild.name}**.\n"
                 f"Tracked Operatives: `{total_members}` | Total Messages: `{total_messages}` | Total Voice: `{total_voice_mins} mins`\n"
             ),
             color=discord.Color.from_rgb(46, 204, 113),
@@ -432,11 +457,11 @@ class Leveling(commands.Cog):
         if lines:
             embed.add_field(name="🏆 Top 5 Operative Roster", value="\n\n".join(lines), inline=False)
         else:
-            embed.add_field(name="🏆 Top 5 Operative Roster", value="*No activity logged this week.*", inline=False)
+            embed.add_field(name="🏆 Top 5 Operative Roster", value="*No activity logged yet.*", inline=False)
 
         embed.add_field(
             name="🚀 Earn XP This Week",
-            value="Participate in discussions, join voice lounges, run `.bump` every 2 hours, and catch random XP drops!",
+            value="Participate in discussions, join voice lounges, bump the server every 2 hours, and catch random XP drops!",
             inline=False
         )
         embed.set_footer(text="Project-Edith • Weekly Automated Digest")
@@ -481,7 +506,6 @@ class Leveling(commands.Cog):
         if message.author.bot or not message.guild:
             return
 
-        # Explicitly ignore all bot command prefixes
         if message.content.startswith((".", ";", "!", "/")):
             return
 
@@ -506,16 +530,6 @@ class Leveling(commands.Cog):
         if random.random() < DROP_CHANCE:
             asyncio.create_task(self.trigger_xp_drop(message.channel))
 
-    @commands.Cog.listener()
-    async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-        if member.bot:
-            return
-
-        if not before.channel and after.channel:
-            self.voice_tracking[member.id] = time.time()
-        elif before.channel and not after.channel:
-            self.voice_tracking.pop(member.id, None)
-
     @tasks.loop(minutes=1)
     async def voice_xp_loop(self):
         if not hasattr(self.bot, "db") or not self.bot.db:
@@ -523,11 +537,12 @@ class Leveling(commands.Cog):
 
         for guild in self.bot.guilds:
             for vc in guild.voice_channels:
-                if len(vc.members) < 2 or vc == guild.afk_channel:
+                non_bot_members = [m for m in vc.members if not m.bot]
+                if len(non_bot_members) < 2 or vc == guild.afk_channel:
                     continue
 
-                for member in vc.members:
-                    if member.bot or not member.voice or member.voice.self_deaf or member.voice.deaf:
+                for member in non_bot_members:
+                    if not member.voice or member.voice.self_deaf or member.voice.deaf:
                         continue
 
                     await self.bot.db.execute("""
@@ -543,11 +558,8 @@ class Leveling(commands.Cog):
     async def before_voice_loop(self):
         await self.bot.wait_until_ready()
 
-    @commands.command(name="rank")
-    async def rank_cmd(self, ctx: commands.Context, member: discord.Member = None):
-        target = member or ctx.author
+    async def _build_rank_embed(self, target: discord.Member) -> discord.Embed:
         data = await self.get_or_create_user(target.id, target.display_name)
-
         needed = calculate_xp_for_level(data["level"])
         bar = get_progress_bar(data["xp"], needed)
 
@@ -583,49 +595,19 @@ class Leveling(commands.Cog):
             embed.add_field(name="👑 Rank Status", value="All milestone roles unlocked!", inline=False)
 
         embed.set_footer(text="Project-Edith • Level Progression")
+        return embed
+
+    @commands.command(name="rank")
+    async def rank_cmd(self, ctx: commands.Context, member: discord.Member = None):
+        target = member or ctx.author
+        embed = await self._build_rank_embed(target)
         await ctx.send(embed=embed)
 
     @app_commands.command(name="rank", description="Check your rank, level, and XP progression.")
     @app_commands.describe(member="Member to inspect")
     async def slash_rank(self, interaction: discord.Interaction, member: discord.Member = None):
         target = member or interaction.user
-        data = await self.get_or_create_user(target.id, target.display_name)
-
-        needed = calculate_xp_for_level(data["level"])
-        bar = get_progress_bar(data["xp"], needed)
-
-        async with self.bot.db.execute("SELECT user_id FROM levels ORDER BY level DESC, xp DESC") as cursor:
-            all_users = await cursor.fetchall()
-
-        rank_pos = 1
-        for idx, row in enumerate(all_users):
-            if row[0] == target.id:
-                rank_pos = idx + 1
-                break
-
-        booster_badge = "🚀 **Active (1.5x XP)**" if is_server_booster(target) else "None (`1.0x`)"
-
-        embed = discord.Embed(
-            title=f"📊 Rank Card — {target.display_name}",
-            color=discord.Color.magenta() if is_server_booster(target) else discord.Color.blue(),
-            timestamp=datetime.now(timezone.utc)
-        )
-        embed.set_thumbnail(url=target.display_avatar.url)
-        embed.add_field(name="🏆 Server Rank", value=f"`#{rank_pos}` of `{len(all_users)}`", inline=True)
-        embed.add_field(name="⭐ Level", value=f"`{data['level']} / {MAX_LEVEL}`", inline=True)
-        embed.add_field(name="🚀 Booster Multiplier", value=booster_badge, inline=True)
-        embed.add_field(name="✨ Current XP", value=f"`{data['xp']} / {needed} XP`", inline=True)
-        embed.add_field(name="💬 Messages", value=f"`{data['messages_count']}`", inline=True)
-        embed.add_field(name="🎙️ Voice Time", value=f"`{data['voice_minutes']} mins`", inline=True)
-        embed.add_field(name="📈 Progress to Level Up", value=f"`{bar}`", inline=False)
-
-        upcoming = [lvl for lvl in sorted(MILESTONE_ROLES.keys()) if lvl > data["level"]]
-        if upcoming:
-            embed.add_field(name="🎯 Next Role Unlock", value=f"**{MILESTONE_ROLES[upcoming[0]][0]}** at Level `{upcoming[0]}`", inline=False)
-        else:
-            embed.add_field(name="👑 Rank Status", value="All milestone roles unlocked!", inline=False)
-
-        embed.set_footer(text="Project-Edith • Level Progression")
+        embed = await self._build_rank_embed(target)
         await interaction.response.send_message(embed=embed)
 
     @commands.command(name="dropxp")
