@@ -1,5 +1,4 @@
 import random
-import asyncio
 from datetime import datetime, date, time, timezone
 import discord
 from discord import app_commands
@@ -19,6 +18,7 @@ RANDOM_BIRTHDAY_WISHES = [
     "Here’s to celebrating you today! Eat plenty of cake and enjoy your special day to the fullest! 🎂🎊"
 ]
 
+
 def get_days_until(day: int, month: int) -> int:
     today = datetime.now(timezone.utc).date()
     try:
@@ -36,7 +36,6 @@ def get_days_until(day: int, month: int) -> int:
         return (target_next_year - today).days
 
 
-# --- Personal Registration Modal ---
 class CleanBirthdayModal(discord.ui.Modal, title="Register Your Birthday"):
     day = discord.ui.TextInput(
         label="Day of Birth (1-31)",
@@ -72,7 +71,7 @@ class CleanBirthdayModal(discord.ui.Modal, title="Register Your Birthday"):
             return
 
         try:
-            date(2024, m, d)  # Use leap year to allow Feb 29
+            date(2024, m, d)
         except ValueError:
             await interaction.followup.send("❌ That day does not exist in the selected month.", ephemeral=True)
             return
@@ -95,7 +94,6 @@ class CleanBirthdayModal(discord.ui.Modal, title="Register Your Birthday"):
             await interaction.followup.send(f"⚠️ Failed to save birthday: `{e}`", ephemeral=True)
 
 
-# --- Master Override Modal ---
 class MasterSetModal(discord.ui.Modal):
     def __init__(self, cog, target_member: discord.Member):
         super().__init__(title=f"Set Birthday: {target_member.name[:16]}")
@@ -154,7 +152,6 @@ class MasterSetModal(discord.ui.Modal):
             await interaction.followup.send(f"⚠️ Failed to save birthday: `{e}`", ephemeral=True)
 
 
-# --- User Select Dropdowns for Master Controls ---
 class DirectorMemberSelect(discord.ui.UserSelect):
     def __init__(self, cog):
         super().__init__(
@@ -219,7 +216,6 @@ class MasterActionView(discord.ui.View):
         await interaction.response.edit_message(content="Select a member to immediately post their birthday celebration:", view=view)
 
 
-# --- Main Clean Dashboard Buttons ---
 class CleanBirthdayView(discord.ui.View):
     def __init__(self, cog):
         super().__init__(timeout=None)
@@ -344,7 +340,6 @@ class CleanBirthdayView(discord.ui.View):
                 await interaction.response.send_message(f"⚠️ Error: `{e}`", ephemeral=True)
 
 
-# --- Birthday Cog Engine ---
 class Birthdays(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -353,7 +348,6 @@ class Birthdays(commands.Cog):
         self.check_birthdays.start()
 
     async def cog_load(self):
-        """Self-registers persistent view once, preventing circular imports in main.py and duplicate modals."""
         self.bot.add_view(self.active_view)
 
     def cog_unload(self):
@@ -361,10 +355,8 @@ class Birthdays(commands.Cog):
 
     def trigger_auto_backup(self, trigger_user: str):
         backup_cog = self.bot.get_cog("DiscordMemoryBackup")
-        if backup_cog and hasattr(backup_cog, "upload_backup_and_prune"):
-            asyncio.create_task(
-                backup_cog.upload_backup_and_prune(reason=f"Auto-Sync: Birthday saved for {trigger_user}")
-            )
+        if backup_cog and hasattr(backup_cog, "mark_dirty"):
+            backup_cog.mark_dirty(reason=f"Birthday saved for {trigger_user}")
 
     async def save_birthday(self, user_id: int, user_name: str, day: int, month: int):
         await self.bot.db.execute("""
@@ -389,7 +381,6 @@ class Birthdays(commands.Cog):
         self.trigger_auto_backup(user_name)
 
     async def dispatch_birthday_announcement(self, user_id: int, user_name: str) -> tuple[bool, str]:
-        """Dispatches the official celebration message into the announcement channel."""
         channel_id = getattr(config, "ANNOUNCEMENT_CHANNEL_ID", None)
         if not channel_id:
             return False, "ANNOUNCEMENT_CHANNEL_ID is not configured in config.py"
@@ -450,7 +441,6 @@ class Birthdays(commands.Cog):
         embed.set_footer(text="Click 'Check Birthday' to see all member countdowns")
         return embed
 
-    # Loop executes once daily at 00:00 UTC
     @tasks.loop(time=time(hour=0, minute=0, tzinfo=timezone.utc))
     async def check_birthdays(self):
         now = datetime.now(timezone.utc)
@@ -514,6 +504,7 @@ class Birthdays(commands.Cog):
         embed = await self.create_panel_embed()
         await interaction.channel.send(embed=embed, view=self.active_view)
         await interaction.response.send_message("Birthday panel deployed.", ephemeral=True)
+
 
 async def setup(bot):
     await bot.add_cog(Birthdays(bot))
