@@ -1,4 +1,5 @@
 import os
+import time
 import stat
 import shutil
 import asyncio
@@ -10,7 +11,7 @@ from discord.ext import commands
 import yt_dlp
 import imageio_ffmpeg
 
-# Explicitly ensure Opus is loaded into memory using custom or system paths
+
 def initialize_opus():
     if discord.opus.is_loaded():
         return True
@@ -37,6 +38,7 @@ def initialize_opus():
 
     print("[VOICE WARNING] Could not bind Opus library. Audio transmission will fail.")
     return False
+
 
 OPUS_INITIALIZED = initialize_opus()
 
@@ -68,6 +70,7 @@ def resolve_ffmpeg_binary() -> str:
             return path
 
     return "ffmpeg"
+
 
 FFMPEG_EXECUTABLE = resolve_ffmpeg_binary()
 
@@ -104,10 +107,11 @@ class Song:
         self.duration = data.get('duration', 0)
         self.thumbnail = data.get('thumbnail', None)
         self.uploader = data.get('uploader', 'SoundCloud / Artist')
+        self.extracted_at = time.time()
 
     @classmethod
     async def from_query(cls, query: str, requester: discord.Member, loop=None):
-        loop = loop or asyncio.get_event_loop()
+        loop = loop or asyncio.get_running_loop()
 
         def extract():
             ydl_opts = dict(YTDL_OPTIONS)
@@ -151,6 +155,27 @@ class MusicPlayerControllerView(discord.ui.View):
             return music_cog.get_music_state(interaction.guild)
         return None
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        vc = interaction.guild.voice_client if interaction.guild else None
+        if not vc or not vc.is_connected():
+            try:
+                await interaction.message.delete()
+            except Exception:
+                pass
+            await interaction.response.send_message("⏹️ This audio session has ended.", ephemeral=True)
+            return False
+
+        if interaction.user.guild_permissions.administrator:
+            return True
+
+        if not interaction.user.voice or interaction.user.voice.channel != vc.channel:
+            await interaction.response.send_message(
+                f"⛔ You must be in {vc.channel.mention} to use the player controls.",
+                ephemeral=True
+            )
+            return False
+        return True
+
     @discord.ui.button(emoji="⏮️", style=discord.ButtonStyle.secondary, custom_id="btn_music_prev")
     async def btn_prev(self, interaction: discord.Interaction, button: discord.ui.Button):
         state = self._resolve_state(interaction)
@@ -186,7 +211,7 @@ class MusicPlayerControllerView(discord.ui.View):
     @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary, custom_id="btn_music_skip")
     async def btn_skip(self, interaction: discord.Interaction, button: discord.ui.Button):
         state = self._resolve_state(interaction)
-        if not state or not state.voice_client or not state.voice_client.is_playing():
+        if not state or not state.voice_client or not (state.voice_client.is_playing() or state.voice_client.is_paused()):
             await interaction.response.send_message("❌ Nothing to skip.", ephemeral=True)
             return
 
@@ -203,6 +228,7 @@ class MusicPlayerControllerView(discord.ui.View):
         queue_list = list(state.queue)
         random.shuffle(queue_list)
         state.queue = collections.deque(queue_list)
+        await state.update_controller_ui()
         await interaction.response.send_message("🔀 Queue shuffled randomly.", ephemeral=True)
 
     @discord.ui.button(emoji="⏹️", style=discord.ButtonStyle.danger, custom_id="btn_music_stop")
@@ -258,13 +284,16 @@ class GuildMusicState:
             self.current_song = self.queue.popleft()
 
             stream_url = self.current_song.stream_url
-            if not stream_url or "manifest" in stream_url:
+            url_age = time.time() - getattr(self.current_song, "extracted_at", 0)
+            if not stream_url or "manifest" in stream_url or url_age > 600:
                 try:
                     with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ydl:
                         refreshed = await self.bot.loop.run_in_executor(
                             None, lambda: ydl.extract_info(self.current_song.webpage_url, download=False)
                         )
                         stream_url = refreshed.get('url', stream_url)
+                        self.current_song.stream_url = stream_url
+                        self.current_song.extracted_at = time.time()
                 except Exception as e:
                     print(f"[STREAM REFRESH ERROR] {e}")
 
@@ -350,7 +379,6 @@ class Music(commands.Cog):
         self.persistent_view = MusicPlayerControllerView()
 
     async def cog_load(self):
-        """Self-registers persistent view once so player buttons persist across reboots."""
         self.bot.add_view(self.persistent_view)
 
     def get_music_state(self, guild: discord.Guild) -> GuildMusicState:
@@ -446,6 +474,7 @@ class Music(commands.Cog):
             if song.thumbnail:
                 embed.set_thumbnail(url=song.thumbnail)
             await interaction.followup.send(embed=embed, ephemeral=True)
+            await state.update_controller_ui()
         else:
             await interaction.followup.send(f"▶️ Loaded **{song.title}** into the audio controller.", ephemeral=True)
 
@@ -482,6 +511,7 @@ class Music(commands.Cog):
             if song.thumbnail:
                 embed.set_thumbnail(url=song.thumbnail)
             await ctx.send(embed=embed, delete_after=10)
+            await state.update_controller_ui()
 
     @commands.command(name="stop", aliases=["disconnect", "dc"])
     async def prefix_stop(self, ctx: commands.Context):
