@@ -1,5 +1,7 @@
 import os
+import re
 import asyncio
+import collections
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -9,6 +11,41 @@ import config
 
 MAX_PURGE_LIMIT = 100
 CONFIRMATION_DELETE_DELAY = 5
+EMOJI_SPAM_THRESHOLD = 4
+
+# Matches custom Discord emojis (<:name:id> or <a:name:id>) and individual Unicode emoji characters
+CUSTOM_EMOJI_PATTERN = re.compile(r"<a?:\w+:\d+>")
+UNICODE_EMOJI_PATTERN = re.compile(
+    r"[\U0001F1E6-\U0001F1FF"
+    r"\U0001F300-\U0001F5FF"
+    r"\U0001F600-\U0001F64F"
+    r"\U0001F680-\U0001F6FF"
+    r"\U0001F700-\U0001F77F"
+    r"\U0001F780-\U0001F7FF"
+    r"\U0001F800-\U0001F8FF"
+    r"\U0001F900-\U0001F9FF"
+    r"\U0001FA00-\U0001FA6F"
+    r"\U0001FA70-\U0001FAFF"
+    r"\u2600-\u26FF"
+    r"\u2700-\u27BF"
+    r"\u231A-\u231B"
+    r"\u23E9-\u23FA"
+    r"\u25AA-\u25FE"
+    r"\u2B50\u2B55]"
+)
+
+
+def find_repeated_emoji(content: str, threshold: int = EMOJI_SPAM_THRESHOLD) -> str | None:
+    """Returns the offending emoji if any single custom or Unicode emoji appears >= threshold times."""
+    custom_matches = CUSTOM_EMOJI_PATTERN.findall(content)
+    text_without_custom = CUSTOM_EMOJI_PATTERN.sub("", content)
+    unicode_matches = UNICODE_EMOJI_PATTERN.findall(text_without_custom)
+
+    counts = collections.Counter(custom_matches + unicode_matches)
+    for emoji_token, count in counts.items():
+        if count >= threshold:
+            return emoji_token
+    return None
 
 
 def is_mod_authorized(member: discord.Member) -> bool:
@@ -99,6 +136,82 @@ class Moderation(commands.Cog):
             return False, f"Hierarchy error: {target.mention}'s role is higher than or equal to Edith's role. Drag Edith's role higher in Server Settings."
 
         return True, "OK"
+
+    # --- Auto-Moderation: Same Emoji Spam Detector ---
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if message.author.bot or not message.guild:
+            return
+
+        # Exempt staff and authorized moderators from auto-warn
+        if is_mod_authorized(message.author):
+            return
+
+        spammed_emoji = find_repeated_emoji(message.content, EMOJI_SPAM_THRESHOLD)
+        if not spammed_emoji:
+            return
+
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        reason = f"Spamming (Sent {EMOJI_SPAM_THRESHOLD}+ identical emojis: {spammed_emoji})"
+
+        await self.init_db()
+        await self.bot.db.execute("""
+            INSERT INTO warnings (guild_id, user_id, moderator_id, reason, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+        """, (message.guild.id, message.author.id, self.bot.user.id, reason, datetime.now(timezone.utc).isoformat()))
+        await self.bot.db.commit()
+
+        backup_cog = self.bot.get_cog("DiscordMemoryBackup")
+        if backup_cog and hasattr(backup_cog, "mark_dirty"):
+            backup_cog.mark_dirty(reason="Auto-Mod Emoji Spam Warning")
+
+        async with self.bot.db.execute(
+            "SELECT COUNT(*) FROM warnings WHERE guild_id = ? AND user_id = ?",
+            (message.guild.id, message.author.id)
+        ) as cur:
+            warn_count = (await cur.fetchone())[0]
+
+        try:
+            await message.author.send(
+                f"⚠️ **Auto-Moderation Warning in {message.guild.name}**\n"
+                f"• **Reason:** {reason}\n"
+                f"• **Total Warnings:** `{warn_count}`"
+            )
+        except Exception:
+            pass
+
+        embed = discord.Embed(
+            title="🚨 Auto-Mod: Emoji Spam Detected",
+            description=(
+                f"{message.author.mention} has received an automated warning for **Spamming**.\n\n"
+                f"• **Violation:** Sent `{EMOJI_SPAM_THRESHOLD}+` identical emojis ({spammed_emoji})\n"
+                f"• **Total Warnings:** `{warn_count}`\n\n"
+                f"⏳ *This notice will auto-delete in 8 seconds.*"
+            ),
+            color=discord.Color.gold(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.set_thumbnail(url=message.author.display_avatar.url)
+        embed.set_footer(text="Project-Edith • Auto-Moderation Shield")
+
+        await message.channel.send(embed=embed, delete_after=8)
+
+        log_embed = discord.Embed(
+            title="⚠️ Auto-Mod Infraction Issued",
+            description=(
+                f"{message.author.mention} (`{message.author.id}`) was automatically warned in {message.channel.mention}.\n\n"
+                f"• **Reason:** {reason}\n"
+                f"• **Total Warnings:** `{warn_count}`"
+            ),
+            color=discord.Color.gold(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        await self.log_mod_action(log_embed, message.guild)
 
     async def execute_purge(self, channel: discord.TextChannel, amount: int, target_member: discord.Member = None) -> int:
         deleted_count = 0
