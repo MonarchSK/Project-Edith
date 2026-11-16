@@ -1,10 +1,12 @@
 import os
+import re
 import stat
 import shutil
 import time
 import math
 import random
 import asyncio
+import collections
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -25,12 +27,54 @@ DROP_XP_MAX = 1000
 DROP_TIMEOUT_SECONDS = 90
 CLAIM_AUTODELETE_SECONDS = 10
 
+EMOJI_SPAM_THRESHOLD = 4
+
 MILESTONE_ROLES = {
     5: ("Bronze Operative", 0xCD7F32),
     10: ("Silver Operative", 0xC0C0C0),
     25: ("Gold Operative", 0xFFD700),
     50: ("Mythic Pinnacle", 0x9B59B6)
 }
+
+CUSTOM_EMOJI_PATTERN = re.compile(r"<a?:\w+:\d+>")
+UNICODE_EMOJI_PATTERN = re.compile(
+    r"[\U0001F1E6-\U0001F1FF"
+    r"\U0001F300-\U0001F5FF"
+    r"\U0001F600-\U0001F64F"
+    r"\U0001F680-\U0001F6FF"
+    r"\U0001F700-\U0001F77F"
+    r"\U0001F780-\U0001F7FF"
+    r"\U0001F800-\U0001F8FF"
+    r"\U0001F900-\U0001F9FF"
+    r"\U0001FA00-\U0001FA6F"
+    r"\U0001FA70-\U0001FAFF"
+    r"\u2600-\u26FF"
+    r"\u2700-\u27BF"
+    r"\u231A-\u231B"
+    r"\u23E9-\u23FA"
+    r"\u25AA-\u25FE"
+    r"\u2B50\u2B55]"
+)
+
+
+def has_emoji_spam(content: str, threshold: int = EMOJI_SPAM_THRESHOLD) -> bool:
+    """Checks if any single custom or Unicode emoji appears >= threshold times."""
+    custom_matches = CUSTOM_EMOJI_PATTERN.findall(content)
+    text_without_custom = CUSTOM_EMOJI_PATTERN.sub("", content)
+    unicode_matches = UNICODE_EMOJI_PATTERN.findall(text_without_custom)
+
+    counts = collections.Counter(custom_matches + unicode_matches)
+    return any(count >= threshold for count in counts.values())
+
+
+def is_mod_exempt(member: discord.Member) -> bool:
+    if not isinstance(member, discord.Member):
+        return False
+    if member.guild_permissions.administrator or member.guild_permissions.ban_members or member.guild_permissions.moderate_members:
+        return True
+    director_role = getattr(config, "DIRECTOR_ROLE_NAME", "Director").lower()
+    allowed_roles = {director_role, "authority", "admin", "administrator", "moderator", "mod", "head mod"}
+    return any(r.name.lower() in allowed_roles for r in member.roles)
 
 
 def resolve_ffmpeg_binary() -> str:
@@ -507,6 +551,10 @@ class Leveling(commands.Cog):
             return
 
         if message.content.startswith((".", ";", "!", "/")):
+            return
+
+        # Do not grant XP or spawn supply drops on messages flagged for emoji spam
+        if not is_mod_exempt(message.author) and has_emoji_spam(message.content):
             return
 
         now = time.time()
