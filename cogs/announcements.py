@@ -38,13 +38,11 @@ def resolve_ping_mention(guild: discord.Guild, raw_ping: str) -> str | None:
     if not raw:
         return None
 
-    # Direct standard mentions
     if raw in ("@everyone", "everyone"):
         return "@everyone"
     if raw in ("@here", "here"):
         return "@here"
 
-    # Match raw role mention: <@&123456789>
     role_mention_match = re.match(r"^<@&(\d+)>$", raw)
     if role_mention_match:
         role_id = int(role_mention_match.group(1))
@@ -52,7 +50,6 @@ def resolve_ping_mention(guild: discord.Guild, raw_ping: str) -> str | None:
         if role:
             return role.mention
 
-    # Match by role name (case-insensitive) or strip leading '@'
     clean_name = raw.lstrip("@").lower()
     for role in guild.roles:
         if role.name.lower() == clean_name:
@@ -85,7 +82,6 @@ class BroadcastConfirmView(discord.ui.View):
         except Exception:
             pass
 
-        # Verify bot permissions in the target channel
         my_perms = self.target_channel.permissions_for(interaction.guild.me)
         if not my_perms.send_messages or not my_perms.embed_links:
             await interaction.followup.send(
@@ -145,7 +141,6 @@ class AnnouncementModal(discord.ui.Modal):
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
-        # Clean up launcher message if invoked from prefix Studio
         if self.studio_message:
             try:
                 await self.studio_message.delete()
@@ -239,8 +234,8 @@ class Announcements(commands.Cog):
         studio_msg = None
 
         async def btn_callback(interaction: discord.Interaction):
-            if not is_announcement_authorized(interaction.user):
-                await interaction.response.send_message("⛔ Authority clearance required.", ephemeral=True)
+            if interaction.user.id != ctx.author.id:
+                await interaction.response.send_message("⛔ Only the command invoker can open this studio prompt.", ephemeral=True)
                 return
             await interaction.response.send_modal(AnnouncementModal(target_channel=destination, studio_message=studio_msg))
 
