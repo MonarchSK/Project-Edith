@@ -19,13 +19,11 @@ class AuditLogs(commands.Cog):
 
     async def get_or_create_audit_channel(self, guild: discord.Guild) -> discord.TextChannel | None:
         """Finds or provisions an #audit-logs channel inside the 🛠️ BACKUPS & CONTROL category."""
-        # Check in-memory cache first
         if guild.id in self.audit_channel_cache:
             cached_chan = guild.get_channel(self.audit_channel_cache[guild.id])
             if cached_chan and isinstance(cached_chan, discord.TextChannel):
                 return cached_chan
 
-        # 1. Check explicit config channel ID
         cfg_id = int(os.getenv("AUDIT_LOGS_CHANNEL_ID", getattr(config, "AUDIT_LOGS_CHANNEL_ID", 0)))
         if cfg_id:
             chan = guild.get_channel(cfg_id)
@@ -33,13 +31,11 @@ class AuditLogs(commands.Cog):
                 self.audit_channel_cache[guild.id] = chan.id
                 return chan
 
-        # 2. Check for existing channel by name
         for c in guild.text_channels:
             if c.name.lower() in ["audit-logs", "message-logs", "msg-logs", "server-audits"]:
                 self.audit_channel_cache[guild.id] = c.id
                 return c
 
-        # 3. Locate or create '🛠️ BACKUPS & CONTROL' category
         target_cat = None
         for cat in guild.categories:
             if "BACKUP" in cat.name.upper() or "CONTROL" in cat.name.upper():
@@ -52,7 +48,6 @@ class AuditLogs(commands.Cog):
             except Exception:
                 target_cat = None
 
-        # 4. Provision channel with secure role overwrites
         try:
             overwrites = {
                 guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -91,7 +86,6 @@ class AuditLogs(commands.Cog):
         if not guild.me.guild_permissions.view_audit_log:
             return None
 
-        # Short pause to allow Discord gateway to register the audit log record
         await asyncio.sleep(0.8)
 
         now = datetime.now(timezone.utc)
@@ -111,7 +105,6 @@ class AuditLogs(commands.Cog):
 
         return None
 
-    # --- Listener: Message Deletions ---
     @commands.Cog.listener()
     async def on_message_delete(self, message: discord.Message):
         if message.author.bot or not message.guild:
@@ -136,7 +129,6 @@ class AuditLogs(commands.Cog):
         embed.set_author(name=f"{message.author} ({message.author.id})", icon_url=message.author.display_avatar.url)
         embed.add_field(name="📄 Message Content", value=content, inline=False)
 
-        # Attribution block
         if deleter and deleter.id != message.author.id:
             embed.add_field(name="🛡️ Action Taken By", value=f"{deleter.mention} (`{deleter.id}`)", inline=True)
         else:
@@ -145,8 +137,7 @@ class AuditLogs(commands.Cog):
         if message.attachments:
             att_list = [f"• [`{att.filename}`]({att.url}) ({round(att.size / 1024, 1)} KB)" for att in message.attachments]
             embed.add_field(name=f"📎 Attachments ({len(message.attachments)})", value="\n".join(att_list[:5]), inline=False)
-            
-            # Preview image if attachment is an image format
+
             first_att = message.attachments[0]
             if first_att.content_type and first_att.content_type.startswith("image/"):
                 embed.set_image(url=first_att.proxy_url or first_att.url)
@@ -158,7 +149,6 @@ class AuditLogs(commands.Cog):
         except Exception as e:
             print(f"[AUDIT DISPATCH ERROR] {e}")
 
-    # --- Listener: Bulk Message Deletions ---
     @commands.Cog.listener()
     async def on_bulk_message_delete(self, messages: list[discord.Message]):
         if not messages:
@@ -184,13 +174,11 @@ class AuditLogs(commands.Cog):
         except Exception as e:
             print(f"[AUDIT BULK DISPATCH ERROR] {e}")
 
-    # --- Listener: Message Edits ---
     @commands.Cog.listener()
     async def on_message_edit(self, before: discord.Message, after: discord.Message):
         if before.author.bot or not before.guild:
             return
 
-        # Skip pinned state mutations, embeds auto-loading, or identical content
         if before.content == after.content:
             return
 
@@ -222,7 +210,6 @@ class AuditLogs(commands.Cog):
         except Exception as e:
             print(f"[AUDIT DISPATCH ERROR] {e}")
 
-    # --- Task: Auto-Delete Audit Logs Older Than 3 Days ---
     @tasks.loop(hours=2)
     async def prune_old_audit_logs(self):
         """Purges messages in the audit-logs channel older than the retention threshold using bulk delete."""
@@ -239,14 +226,12 @@ class AuditLogs(commands.Cog):
                 bulk_eligible = []
                 single_eligible = []
 
-                async for msg in channel.history(limit=250):
-                    if msg.created_at < cutoff_date:
-                        if msg.created_at > bulk_limit_date:
-                            bulk_eligible.append(msg)
-                        else:
-                            single_eligible.append(msg)
+                async for msg in channel.history(limit=250, before=cutoff_date):
+                    if msg.created_at > bulk_limit_date:
+                        bulk_eligible.append(msg)
+                    else:
+                        single_eligible.append(msg)
 
-                # 1. Fast purge using Discord's bulk API (<14 days old)
                 if bulk_eligible:
                     for i in range(0, len(bulk_eligible), 100):
                         chunk = bulk_eligible[i:i + 100]
@@ -256,7 +241,6 @@ class AuditLogs(commands.Cog):
                             await channel.delete_messages(chunk)
                         await asyncio.sleep(1.0)
 
-                # 2. Sequential fallback for messages older than 14 days
                 for msg in single_eligible:
                     try:
                         await msg.delete()
